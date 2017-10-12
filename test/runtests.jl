@@ -2,8 +2,6 @@
 ## Test suite for Julia's WAV module
 import WAV
 using Base.Test
-using Compat
-using Compat.String
 
 # These float array comparison functions are from dists.jl
 function absdiff(current::AbstractArray{T}, target::AbstractArray{T}) where T <: Real
@@ -11,7 +9,11 @@ function absdiff(current::AbstractArray{T}, target::AbstractArray{T}) where T <:
     maximum(abs.(current - target))
 end
 
+<<<<<<< HEAD
 function reldiff(current::T, target::T) where T <: Real
+=======
+function reldiff{T<:Real}(current::T, target::T)
+>>>>>>> starting to pull out all the non-WAV code
     abs.((current - target)/(bool(target) ? target : 1))
 end
 
@@ -71,6 +73,7 @@ let
     nchannels = size(samples, 2)
     sample_rate = 8000
     nbits = ceil(Integer, nbits / 8) * 8
+<<<<<<< HEAD
     block_align = nbits / 8 * nchannels
     bps = sample_rate * block_align
     data_length::UInt32 = size(samples, 1) * block_align
@@ -82,6 +85,19 @@ let
                         block_align,
                         nbits,
                         WAV.WAVFormatExtension())
+=======
+    const block_align = nbits / 8 * nchannels
+    const bps = sample_rate * block_align
+    const data_length::UInt32 = size(samples, 1) * block_align
+
+    const fmt = WAV.WAVFormat(compression,
+                              nchannels,
+                              sample_rate,
+                              bps,
+                              block_align,
+                              nbits,
+                              WAV.WAVFormatExtension())
+>>>>>>> starting to pull out all the non-WAV code
 
     WAV.write_header(io, UInt32(data_length + 37)) # 37 instead of 36 is the broken part
     WAV.write_format(io, fmt)
@@ -514,6 +530,7 @@ let
     @test ext[:test] == in_chunks[:test]
 end
 
+<<<<<<< HEAD
 ### WAVArray
 struct TestHtmlDisplay <: Display
     io::IOBuffer
@@ -530,6 +547,8 @@ let
     @test ismatch(r"audio controls", String(take!(copy(myio))))
 end
 
+=======
+>>>>>>> starting to pull out all the non-WAV code
 ### playback
 # The playback tests don't work on travis.
 let
