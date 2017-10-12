@@ -1,140 +1,127 @@
 # -*- mode: julia; -*-
-VERSION >= v"0.4.0-dev+6521" && Base.__precompile__(true)
 module WAV
-export wavread, wavwrite, wavappend, wavplay
-export WAVArray, WAVFormatExtension, WAVFormat
-export isextensible, isformat, bits_per_sample
+export WAVFormatExtension, WAVFormat
 export WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_ALAW, WAVE_FORMAT_MULAW
 using FileIO
-using Compat
 
-function __init__()
-    module_dir = dirname(@__FILE__)
-    if Libdl.find_library(["libpulse-simple"]) != ""
-        include(joinpath(module_dir, "wavplay-pulse.jl"))
-    elseif Libdl.find_library(["AudioToolbox"],
-                              ["/System/Library/Frameworks/AudioToolbox.framework/Versions/A"]) != ""
-        include(joinpath(module_dir, "wavplay-audioqueue.jl"))
+include("companding.jl")
+include("formats.jl")
+
+mutable struct WAVSink{IO} <: SampleSink where IO
+    io::IO
+end
+
+mutable struct WAVSource{IO} <: SampleSource where IO
+    io::IO
+    format::WAVFormat
+    opt::Dict{Symbol, Vector{UInt8}}
+    bytesleft::Int
+end
+
+function WAVSource(io)
+    bytesleft = read_wave_header(io)
+    fmt, opts, bytesleft = find_format(io, bytesleft)
+    eltype = type_from_format(fmt)
+
+    # now we have a WAVSource ready to provide audio data
+    src
+end
+
+"""
+Convert the underlying wav format to a Julia type that we can
+use to parameterize sources/sinks for type-stable reads and writes.
+"""
+function type_from_format(fmt)
+    if isformat(fmt, WAVE_FORMAT_PCM)
+        return Fixed{Int16, 15}
+    elseif isformat(fmt, WAVE_FORMAT_IEEE_FLOAT)
+        return Float32
+    elseif isformat(fmt, WAVE_FORMAT_MULAW)
+        # This stream will appear as a 16-bit fixed-point stream,
+        # and we'll compand to/from 8-bit on read/write
+        return Fixed{Int16, 15}
+    elseif isformat(fmt, WAVE_FORMAT_ALAW)
+        return Fixed{Int16, 15}
     else
-        include(joinpath(module_dir, "wavplay-unsupported.jl"))
+        if isextensible(fmt)
+            error("Unrecognized format code (extensible): $(fmt.ext.sub_format)")
+        else
+            error("Unrecognized format code: $(fmt.compression_code)")
+        end
     end
 end
 
-include("AudioDisplay.jl")
+"""
+Find the format subchunk, and store up any non-data chunks it finds
+along the way.
+"""
+function find_format(io, bytesleft)
+    opt = Dict{Symbol, Vector{UInt8}}()
+    while bytesleft > 0
+        (subchunk_id,
+         subchunk_size,
+         bytesleft) = read_subchunk_header(io, bytesleft)
+        if subchunk_id == b"fmt "
+            format = read_format(io, subchunk_size)
+            bytesleft -= subchunk_size
+            return format, opt, bytesleft
+        elseif subchunk_id == b"data"
+            error("Got data chunk before fmt chunk")
+        elseif subchunk_id == b""
+            # corrupt chunk, don't do anything
+        else
+            opt[Symbol(subchunk_id)] = read(io, UInt8, subchunk_size)
+            bytesleft -= subchunk_size
+        end
+    end
+    error("Parsed whole file without seeing a fmt chunk")
+end
+
 wavplay(fname) = wavplay(wavread(fname)[1:2]...)
 
 # The WAV specification states that numbers are written to disk in little endian form.
 write_le(stream::IO, value) = write(stream, htol(value))
 read_le(stream::IO, x::Type) = ltoh(read(stream, x))
 
-
-# used by WAVE_FORMAT_EXTENSIBLE
-immutable WAVFormatExtension
-    nbits::UInt16 # overrides nbits in WAVFormat type
-    channel_mask::UInt32
-    sub_format::Array{UInt8, 1} # 16 byte GUID
-    WAVFormatExtension() = new(0, 0, Array{UInt8, 1}(0))
-    WAVFormatExtension(nb, cm, sb) = new(nb, cm, sb)
-end
-
-# Required WAV Chunk; The format chunk describes how the waveform data is stored
-immutable WAVFormat
-    compression_code::UInt16
-    nchannels::UInt16
-    sample_rate::UInt32
-    bytes_per_second::UInt32 # average bytes per second
-    block_align::UInt16
-    nbits::UInt16
-    ext::WAVFormatExtension
-end
-
-const WAVE_FORMAT_PCM        = 0x0001 # PCM
-const WAVE_FORMAT_IEEE_FLOAT = 0x0003 # IEEE float
-const WAVE_FORMAT_ALAW       = 0x0006 # A-Law
-const WAVE_FORMAT_MULAW      = 0x0007 # Mu-Law
-const WAVE_FORMAT_EXTENSIBLE = 0xfffe # Extension!
-
-isextensible(fmt::WAVFormat) = (fmt.compression_code == WAVE_FORMAT_EXTENSIBLE)
-bits_per_sample(fmt::WAVFormat) = isextensible(fmt) ? fmt.ext.nbits : fmt.nbits
-
-# DEFINE_GUIDSTRUCT("00000001-0000-0010-8000-00aa00389b71", KSDATAFORMAT_SUBTYPE_PCM);
-const KSDATAFORMAT_SUBTYPE_PCM = [
-0x01, 0x00, 0x00, 0x00,
-0x00, 0x00,
-0x10, 0x00,
-0x80, 0x00,
-0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
-                                  ]
-# DEFINE_GUIDSTRUCT("00000003-0000-0010-8000-00aa00389b71", KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
-const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = [
-0x03, 0x00, 0x00, 0x00,
-0x00, 0x00,
-0x10, 0x00,
-0x80, 0x00,
-0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
-                                         ]
-# DEFINE_GUID(KSDATAFORMAT_SUBTYPE_MULAW, 0x00000007, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
-const KSDATAFORMAT_SUBTYPE_MULAW = [
-0x07, 0x00, 0x00, 0x00,
-0x00, 0x00,
-0x10, 0x00,
-0x80, 0x00,
-0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
-                                    ]
-#DEFINE_GUID(KSDATAFORMAT_SUBTYPE_ALAW, 0x00000006, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71);
-const KSDATAFORMAT_SUBTYPE_ALAW = [
-0x06, 0x00, 0x00, 0x00,
-0x00, 0x00,
-0x10, 0x00,
-0x80, 0x00,
-0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71
-                                   ]
-
-function isformat(fmt::WAVFormat, code)
-    if code != WAVE_FORMAT_EXTENSIBLE && isextensible(fmt)
-        subtype = Array{UInt8, 1}(0)
-        if code == WAVE_FORMAT_PCM
-            subtype = KSDATAFORMAT_SUBTYPE_PCM
-        elseif code == WAVE_FORMAT_IEEE_FLOAT
-            subtype = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-        elseif code == WAVE_FORMAT_ALAW
-            subtype = KSDATAFORMAT_SUBTYPE_ALAW
-        elseif code == WAVE_FORMAT_MULAW
-            subtype = KSDATAFORMAT_SUBTYPE_MULAW
-        else
-            return false
-        end
-        return subtype == fmt.ext.sub_format
-    end
-    return fmt.compression_code == code
-end
-
-function WAVFormatExtension(bytes)
-    if isempty(bytes)
-        return WAVFormatExtension()
-    end
-    # split bytes into valid_bits_per_sample, channel_mask, and sub_format
-    valid_bits_per_sample = (convert(UInt16, bytes[2]) << 8) | convert(UInt16, bytes[1])
-    channel_mask = (convert(UInt32, bytes[6]) << 24) | (convert(UInt32, bytes[5]) << 16) | (convert(UInt32, bytes[4]) << 8) | convert(UInt32, bytes[3])
-    sub_format = bytes[7:end]
-    return WAVFormatExtension(valid_bits_per_sample, channel_mask, sub_format)
-end
-
-function read_header(io::IO)
+function read_wave_header(io::IO)
     # check if the given file has a valid RIFF header
     riff = read(io, UInt8, 4)
     if riff !=  b"RIFF"
         error("Invalid WAV file: The RIFF header is invalid")
     end
 
-    chunk_size = read_le(io, UInt32)
+    chunk_size = Int(read_le(io, UInt32))
 
     # check if this is a WAV file
     format = read(io, UInt8, 4)
     if format != b"WAVE"
         error("Invalid WAV file: the format is not WAVE")
     end
-    return chunk_size
+    # the given file size doesn't include the "RIFF" and "WAVE" strings,
+    # but does include the 32-bit file size field itself, so we want
+    # to compensate for that
+    return chunk_size - 4
+end
+
+"""
+Reads a chunk header from the given stream, assuming that there's the
+given number of bytes remaining in the file.
+
+Returns the subchunk ID, subchunk size, and new number of bytes remaining.
+"""
+function read_subchunk_header(io::IO, bytesleft)
+    if bytesleft < 8
+        warn("File ended with partial subchunk header")
+        return b"", 0, 0
+    end
+    subchunk_id = read(io, UInt8, 4)
+    subchunk_size = Int(read_le(io, UInt32))
+    bytesleft -= 8
+    if subchunk_size > bytesleft
+        warn("File ended with partial subchunk data")
+        subchunk_size = bytesleft
+    end
+    return subchunk_id, subchunk_size, bytesleft
 end
 
 function write_header(io::IO, data_length::UInt32)
@@ -142,8 +129,8 @@ function write_header(io::IO, data_length::UInt32)
     write_le(io, data_length) # chunk_size
     write(io, b"WAVE")
 end
-write_standard_header(io, data_length) = write_header(io, @compat UInt32(data_length + 36))
-write_extended_header(io, data_length) = write_header(io, @compat UInt32(data_length + 60))
+write_standard_header(io, data_length) = write_header(io, UInt32(data_length + 36))
+write_extended_header(io, data_length) = write_header(io, UInt32(data_length + 60))
 
 function read_format(io::IO, chunk_size::UInt32)
     # can I read in all of the fields at once?
@@ -221,15 +208,15 @@ function read_pcm_samples(io::IO, fmt::WAVFormat, subrange)
     sample_type = eltype(samples)
     const nbytes = ceil(Integer, nbits / 8)
     const bitshift = [0x0, 0x8, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40]
-    mask = @compat UInt64(0x1) << (nbits - 1)
+    mask = UInt64(0x1) << (nbits - 1)
     if nbits <= 8
-        mask = @compat UInt64(0)
+        mask = UInt64(0)
     end
     skip(io, convert(UInt, (first(subrange) - 1) * nbytes * fmt.nchannels))
     for i = 1:size(samples, 1)
         for j = 1:size(samples, 2)
             raw_sample = read(io, UInt8, nbytes)
-            my_sample = @compat UInt64(0)
+            my_sample = UInt64(0)
             for k = 1:nbytes
                 my_sample |= convert(UInt64, raw_sample[k]) << bitshift[k]
             end
@@ -262,223 +249,6 @@ end
 function read_ieee_float_samples(io::IO, fmt::WAVFormat, subrange)
     const floatType = ieee_float_container_type(bits_per_sample(fmt))
     read_ieee_float_samples(io, fmt, subrange, floatType)
-end
-
-function read_companded_samples(io::IO, fmt::WAVFormat, subrange, table)
-    if isempty(subrange)
-        return Array{eltype(table), 2}(0, fmt.nchannels)
-    end
-    const nblocks = length(subrange)
-    samples = Array{eltype(table), 2}(nblocks, fmt.nchannels)
-    skip(io, convert(UInt, (first(subrange) - 1) * fmt.nchannels))
-    for i = 1:nblocks
-        for j = 1:fmt.nchannels
-            # add one to value from blocks because A-law stores values from 0 to 255.
-            const compressedByte::UInt8 = read(io, UInt8)
-            # Julia indexing is 1-based; I need a value from 1 to 256
-            samples[i, j] = table[compressedByte + 1]
-        end
-    end
-    return samples
-end
-
-function read_mulaw_samples(io::IO, fmt::WAVFormat, subrange)
-    # Quantized μ-law algorithm -- Use a look up table to convert
-    # From Wikipedia, ITU-T Recommendation G.711 and G.191 specify the following intervals:
-    #
-    # ---------------------------------------+--------------------------------
-    #  14 bit Binary Linear input code       | 8 bit Compressed code
-    # ---------------------------------------+--------------------------------
-    # +8158 to +4063 in 16 intervals of 256  |  0x80 + interval number
-    # +4062 to +2015 in 16 intervals of 128  |  0x90 + interval number
-    # +2014 to +991 in 16 intervals of 64    |  0xA0 + interval number
-    # +990 to +479 in 16 intervals of 32     |  0xB0 + interval number
-    # +478 to +223 in 16 intervals of 16     |  0xC0 + interval number
-    # +222 to +95 in 16 intervals of 8       |  0xD0 + interval number
-    # +94 to +31 in 16 intervals of 4        |  0xE0 + interval number
-    # +30 to +1 in 15 intervals of 2         |  0xF0 + interval number
-    # 0                                      |  0xFF
-    # −1                                     |  0x7F
-    # −31 to −2 in 15 intervals of 2         |  0x70 + interval number
-    # −95 to −32 in 16 intervals of 4        |  0x60 + interval number
-    # −223 to −96 in 16 intervals of 8       |  0x50 + interval number
-    # −479 to −224 in 16 intervals of 16     |  0x40 + interval number
-    # −991 to −480 in 16 intervals of 32     |  0x30 + interval number
-    # −2015 to −992 in 16 intervals of 64    |  0x20 + interval number
-    # −4063 to −2016 in 16 intervals of 128  |  0x10 + interval number
-    # −8159 to −4064 in 16 intervals of 256  |  0x00 + interval number
-    # ---------------------------------------+--------------------------------
-    const MuLawDecompressTable =
-    [
-    -32124,-31100,-30076,-29052,-28028,-27004,-25980,-24956,
-    -23932,-22908,-21884,-20860,-19836,-18812,-17788,-16764,
-    -15996,-15484,-14972,-14460,-13948,-13436,-12924,-12412,
-    -11900,-11388,-10876,-10364, -9852, -9340, -8828, -8316,
-    -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
-    -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
-    -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
-    -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
-    -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
-    -1372, -1308, -1244, -1180, -1116, -1052,  -988,  -924,
-    -876,  -844,  -812,  -780,  -748,  -716,  -684,  -652,
-    -620,  -588,  -556,  -524,  -492,  -460,  -428,  -396,
-    -372,  -356,  -340,  -324,  -308,  -292,  -276,  -260,
-    -244,  -228,  -212,  -196,  -180,  -164,  -148,  -132,
-    -120,  -112,  -104,   -96,   -88,   -80,   -72,   -64,
-    -56,   -48,   -40,   -32,   -24,   -16,    -8,     -1,
-    32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
-    23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
-    15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
-    11900, 11388, 10876, 10364,  9852,  9340,  8828,  8316,
-    7932,  7676,  7420,  7164,  6908,  6652,  6396,  6140,
-    5884,  5628,  5372,  5116,  4860,  4604,  4348,  4092,
-    3900,  3772,  3644,  3516,  3388,  3260,  3132,  3004,
-    2876,  2748,  2620,  2492,  2364,  2236,  2108,  1980,
-    1884,  1820,  1756,  1692,  1628,  1564,  1500,  1436,
-    1372,  1308,  1244,  1180,  1116,  1052,   988,   924,
-    876,   844,   812,   780,   748,   716,   684,   652,
-    620,   588,   556,   524,   492,   460,   428,   396,
-    372,   356,   340,   324,   308,   292,   276,   260,
-    244,   228,   212,   196,   180,   164,   148,   132,
-    120,   112,   104,    96,    88,    80,    72,    64,
-    56,    48,    40,    32,    24,    16,     8,     0
-     ]
-    @assert length(MuLawDecompressTable) == 256
-    return read_companded_samples(io, fmt, subrange, MuLawDecompressTable)
-end
-
-function read_alaw_samples(io::IO, fmt::WAVFormat, subrange)
-    # Quantized A-law algorithm -- Use a look up table to convert
-    const ALawDecompressTable =
-    [
-    -5504, -5248, -6016, -5760, -4480, -4224, -4992, -4736,
-    -7552, -7296, -8064, -7808, -6528, -6272, -7040, -6784,
-    -2752, -2624, -3008, -2880, -2240, -2112, -2496, -2368,
-    -3776, -3648, -4032, -3904, -3264, -3136, -3520, -3392,
-    -22016,-20992,-24064,-23040,-17920,-16896,-19968,-18944,
-    -30208,-29184,-32256,-31232,-26112,-25088,-28160,-27136,
-    -11008,-10496,-12032,-11520,-8960, -8448, -9984, -9472,
-    -15104,-14592,-16128,-15616,-13056,-12544,-14080,-13568,
-    -344,  -328,  -376,  -360,  -280,  -264,  -312,  -296,
-    -472,  -456,  -504,  -488,  -408,  -392,  -440,  -424,
-    -88,   -72,   -120,  -104,  -24,   -8,    -56,   -40,
-    -216,  -200,  -248,  -232,  -152,  -136,  -184,  -168,
-    -1376, -1312, -1504, -1440, -1120, -1056, -1248, -1184,
-    -1888, -1824, -2016, -1952, -1632, -1568, -1760, -1696,
-    -688,  -656,  -752,  -720,  -560,  -528,  -624,  -592,
-    -944,  -912,  -1008, -976,  -816,  -784,  -880,  -848,
-    5504,  5248,  6016,  5760,  4480,  4224,  4992,  4736,
-    7552,  7296,  8064,  7808,  6528,  6272,  7040,  6784,
-    2752,  2624,  3008,  2880,  2240,  2112,  2496,  2368,
-    3776,  3648,  4032,  3904,  3264,  3136,  3520,  3392,
-    22016, 20992, 24064, 23040, 17920, 16896, 19968, 18944,
-    30208, 29184, 32256, 31232, 26112, 25088, 28160, 27136,
-    11008, 10496, 12032, 11520, 8960,  8448,  9984,  9472,
-    15104, 14592, 16128, 15616, 13056, 12544, 14080, 13568,
-    344,   328,   376,   360,   280,   264,   312,   296,
-    472,   456,   504,   488,   408,   392,   440,   424,
-    88,    72,   120,   104,    24,     8,    56,    40,
-    216,   200,   248,   232,   152,   136,   184,   168,
-    1376,  1312,  1504,  1440,  1120,  1056,  1248,  1184,
-    1888,  1824,  2016,  1952,  1632,  1568,  1760,  1696,
-    688,   656,   752,   720,   560,   528,   624,   592,
-    944,   912,  1008,   976,   816,   784,   880,   848
-     ]
-    @assert length(ALawDecompressTable) == 256
-    return read_companded_samples(io, fmt, subrange, ALawDecompressTable)
-end
-
-function compress_sample_mulaw(sample)
-    const MuLawCompressTable =
-    [
-    0,0,1,1,2,2,2,2,3,3,3,3,3,3,3,3,
-    4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,
-    5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
-    5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
-    6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
-    6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
-    6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
-    6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7
-     ]
-    @assert length(MuLawCompressTable) == 256
-    const cBias = 0x84
-    const cClip = 32635
-
-    const sampleSign = (sample >>> 8) & 0x80
-    if sampleSign != 0
-        sample = -sample
-    end
-    if sample > cClip
-        sample = cClip
-    end
-    sample = sample + cBias
-    const sampleExponent = MuLawCompressTable[(sample >>> 7) + 1]
-    const mantissa = (sample >> (sampleExponent+3)) & 0x0F
-    @compat UInt8((~ (sampleSign | (sampleExponent << 4) | mantissa)) & 0xff)
-end
-
-function compress_sample_alaw(sample)
-    const ALawCompressTable =
-    [
-    1,1,2,2,3,3,3,3,
-    4,4,4,4,4,4,4,4,
-    5,5,5,5,5,5,5,5,
-    5,5,5,5,5,5,5,5,
-    6,6,6,6,6,6,6,6,
-    6,6,6,6,6,6,6,6,
-    6,6,6,6,6,6,6,6,
-    6,6,6,6,6,6,6,6,
-    7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7,
-    7,7,7,7,7,7,7,7
-     ]
-    @assert length(ALawCompressTable) == 128
-    const cBias = 0x84
-    const cClip = 32635
-    const sampleSign = ((~sample >>> 8) & 0x80)
-    if sampleSign == 0
-        sample = -sample
-    end
-    if sample > cClip
-        sample = cClip
-    end
-    compressedByte = 0
-    if sample >= 256
-        const sampleExponent = ALawCompressTable[((sample >>> 8) & 0x7f) + 1]
-        const mantissa = (sample >>> (sampleExponent + 3) ) & 0x0f
-        compressedByte = ((sampleExponent << 4) | mantissa) & 0xff
-    else
-        compressedByte = (sample >>> 4) & 0xff
-    end
-    compressedByte = xor(xor(sampleSign, 0x55), compressedByte)
-    @compat UInt8(compressedByte & 0xff)
-end
-
-
-function write_companded_samples{T<:Integer}(io::IO, samples::AbstractArray{T}, compander::Function)
-    for i = 1:size(samples, 1)
-        for j = 1:size(samples, 2)
-            write_le(io, compander(samples[i, j]))
-        end
-    end
-end
-
-function write_companded_samples{T<:AbstractFloat}(io::IO, samples::AbstractArray{T}, compander::Function)
-    samples = convert(Array{Int16}, @compat round.(samples * typemax(Int16)))
-    write_companded_samples(io, samples, compander)
 end
 
 # PCM data is two's-complement except for resolutions of 1-8 bits, which are represented as offset binary.
@@ -539,10 +309,10 @@ function write_pcm_samples{T<:AbstractFloat}(io::IO, fmt::WAVFormat, samples::Ab
     # Scale the floating point values to the PCM range
     if nbits > 8
         # two's complement
-        samples = convert(Array{pcm_container_type(nbits)}, @compat round.(samples * (2.0^(nbits - 1) - 1)))
+        samples = convert(Array{pcm_container_type(nbits)}, round.(samples * (2.0^(nbits - 1) - 1)))
     else
         # offset binary
-        samples = convert(Array{UInt8}, @compat round.((samples .+ 1.0) / 2.0 * (2.0^nbits - 1)))
+        samples = convert(Array{UInt8}, round.((samples .+ 1.0) / 2.0 * (2.0^nbits - 1)))
     end
     return write_pcm_samples(io, fmt, samples)
 end
@@ -583,7 +353,7 @@ function wavread(io::IO; subrange=Void, format="double")
     chunk_size = read_header(io)
     samples = Array{Float64, 1}()
     nbits = 0
-    sample_rate = @compat Float32(0.0)
+    sample_rate = Float32(0.0)
     opt = Dict{Symbol, Any}()
 
     # Note: This assumes that the format chunk is written in the file before the data chunk. The
@@ -606,7 +376,7 @@ function wavread(io::IO; subrange=Void, format="double")
         # check the subchunk ID
         if subchunk_id == b"fmt "
             fmt = read_format(io, subchunk_size)
-            sample_rate = @compat Float32(fmt.sample_rate)
+            sample_rate = Float32(fmt.sample_rate)
             nbits = bits_per_sample(fmt)
             opt[:fmt] = fmt
         elseif subchunk_id == b"data"
@@ -615,7 +385,7 @@ function wavread(io::IO; subrange=Void, format="double")
             end
             samples = read_data(io, subchunk_size, fmt, format, make_range(subrange))
         else
-            opt[@compat Symbol(subchunk_id)] = read(io, UInt8, subchunk_size)
+            opt[Symbol(subchunk_id)] = read(io, UInt8, subchunk_size)
         end
     end
     return samples, sample_rate, nbits, opt
@@ -698,7 +468,7 @@ function wavwrite(samples::AbstractArray, io::IO; Fs=8000, nbits=0, compression=
 
     for eachchunk in chunks
         write(io, eachchunk[1])
-        write_le(io, @compat UInt32(length(eachchunk[2])))
+        write_le(io, UInt32(length(eachchunk[2])))
         for eachbyte in eachchunk[2]
             write(io, eachbyte)
         end

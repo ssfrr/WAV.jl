@@ -8,38 +8,29 @@ WAV.jl
 [![Windows Build Status](https://ci.appveyor.com/api/projects/status/github/dancasimiro/wav.jl?branch=master&svg=true)](https://ci.appveyor.com/project/dancasimiro/wav-jl)
 [![Coverage Status](https://coveralls.io/repos/dancasimiro/WAV.jl/badge.png)](https://coveralls.io/r/dancasimiro/WAV.jl)
 
-This is a Julia package to read and write the WAV audio file format.
-
-Installation
-------------
-
-    julia> Pkg.add("WAV")
+This is a pure Julia package to read and write the WAV audio file format.
 
 Getting Started
 ---------------
 
-WAV provides `wavread`, `wavwrite`, and `wavappend` commands to read,
-write, and append WAV files. Here is an example to get you started. It
-generates some data, writes it to a file and then reads the data back.
-`wavplay` is also provided for simple audio playback.
+WAV provides an interface to work with `.wav` files using the [FileIO](https://github.com/JuliaIO/FileIO.jl) interface, and `SampleBuf` objects from the [SampledSignals](https://github.com/JuliaAudio/SampledSignals.jl) package, implemented in pure Julia. Here is an example to get you started. It
+generates some data, writes it to a file and then reads the data back. Data is kept in its native format (sample rate and type) when possible, but automatically converted by the SampledSignals infrastructure when necessary. Additionally, if the WAV file is 8-bit with μ-law or a-law companding, it will be automatically decoded to 16-bit integer values.
 
 ```jlcon
 julia> using WAV
 julia> x = [0:7999;]
 julia> y = sin.(2 * pi * x / 8000)
-julia> wavwrite(y, "example.wav", Fs=8000)
-julia> y, fs = wavread("example.wav")
-julia> y = cos.(2 * pi * x / 8000)
-julia> wavappend(y, "example.wav")
-julia> y, fs = wavread("example.wav")
-julia> wavplay(y, fs)
+julia> save("example.wav", y, samplerate=8000)
+julia> y = load("example.wav")
+julia> y *= 2
 ```
 
-wavread
--------
+For MATLAB compatibility we also provide a `wavread` function with the same arguments.
 
-This function reads the samples from a WAV file. The samples are converted to floating
-point values in the range from -1.0 to 1.0 by default.
+load
+----
+
+This function reads the samples from a WAV file, returning a `SampleBuf`.
 
 ```julia
 function wavread(io::IO; subrange=Any, format="double")
@@ -47,15 +38,6 @@ function wavread(filename::String; subrange=Any, format="double")
 ```
 
 The available options, and the default values, are:
-
-* ``format`` (default = ``double``): changes the format of the returned samples. The string
-  ``double`` returns double precision floating point values in the range -1.0 to 1.0. The string
-  ``native`` returns the values as encoded in the file. The string ``size`` returns the number
-  of samples in the file, rather than the actual samples.
-* ``subrange`` (default = ``Any``): controls which samples are returned. The default, ``Any``
-  returns all of the samples. Passing a number (``Real``), ``N``, will return the first ``N``
-  samples of each channel. Passing a range (``Range1{Real}``), ``R``, will return the samples
-  in that range of each channel.
 
 The returned values are:
 
@@ -189,25 +171,8 @@ function wavappend(samples::Array, io::IO)
 function wavappend(samples::Array, filename::String)
 ```
 
-wavplay
--------
+Related Packages
+----------------
 
-Playing audio back is also supported. The supported backends are:
-AudioQueue (MacOSX) and Pulse Audio (Linux, libpulse-simple). There is
-not a native backend for Windows yet.
-
-```julia
-function wavplay(samples::Array, fs::Number)
-```
-
-Other Julia Audio Packages
------------------------
-
-[AudioIO](https://github.com/ssfrr/AudioIO.jl) is another audio
-library in the Julia ecosystem. It supports more file formats
-(including WAV) and implements a more powerful playback
-interface. However, the license is more restrictive (GPL) because
-of a dependence on [libsndfile](http://www.mega-nerd.com/libsndfile/).
-
-Additionally, [FLAC.jl](https://github.com/dmbates/FLAC.jl) includes
+[FLAC.jl](https://github.com/dmbates/FLAC.jl) includes
 an ```mmap``` based WAV [reader](https://github.com/dmbates/FLAC.jl/blob/master/src/WAV.jl).
