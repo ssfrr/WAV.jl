@@ -1,31 +1,79 @@
 # -*- mode: julia; -*-
 module WAV
+export WAVSink, WAVSource
 export WAVFormatExtension, WAVFormat
 export WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_ALAW, WAVE_FORMAT_MULAW
 using FileIO
 
 include("companding.jl")
 include("formats.jl")
+include("fileio.jl")
 
+"""
+    WAVSink(io) # TODO: kwargs here!
+
+Create a writable audio stream that will write WAV-formatted data to the given
+io stream.
+"""
 mutable struct WAVSink{IO} <: SampleSink where IO
     io::IO
+    format::WAVFormat
+    totalbytes::Int
 end
 
-mutable struct WAVSource{IO} <: SampleSource where IO
+"""
+    WAVSource(io)
+
+Create a readble audio stream from a WAV file represented by the given io
+stream.
+"""
+mutable struct WAVSource{IO, T} <: SampleSource where IO, T
     io::IO
     format::WAVFormat
     opt::Dict{Symbol, Vector{UInt8}}
     bytesleft::Int
+    subchunk_bytesleft::Int
 end
 
 function WAVSource(io)
     bytesleft = read_wave_header(io)
-    fmt, opts, bytesleft = find_format(io, bytesleft)
+    fmt, opt, bytesleft = find_format(io, bytesleft)
     eltype = type_from_format(fmt)
+    # read into the stream until we find the data
+    subchunk_bytesleft, bytesleft = find_data(io, opt, bytesleft)
 
     # now we have a WAVSource ready to provide audio data
-    src
+    WAVSource{eltype, typeof(io)}(io, fmt, opt, bytesleft, subchunk_bytesleft)
 end
+
+SampledSignals.nchannels(src::WAVSource) = Int(src.fmt.nchannels)
+SampledSignals.samplerate(src::WAVSource) = float(src.fmt.sample_rate)
+Base.eltype(::WAVSource{IO, T}) where IO, T = T
+SampledSignals.nframes(src::WAVSource)
+
+# alias this type for convenience
+const Fixed16 = Fixed{Int16, 15}
+
+# WAV streams present themselves either as Float32 or Fixed16 streams.
+# If the underlying file is Float32 or Fixed16 than we just need to copy
+# the data as-is, but if it's companded 8-bit data than we decode it into
+# 16-bit data for the user
+function SampledSignals.unsafe_read!{IO}(src::WAVSource{IO, Fixed16}, buf::Array,
+                                         frameoffset, framecount)
+    if isformat(src.fmt, WAVE_FORMAT_PCM)
+    elseif isformat(src.fmt, WAVE_FORMAT_MULAW)
+        error("not implemented....yet")
+    elseif isformat(src.fmt, WAVE_FORMAT_ALAW)
+        error("not implemented....yet")
+    else
+        @assert false
+    end
+end
+function SampledSignals.unsafe_read!{IO}(src::WAVSource{IO, Float32}, buf::Array,
+                                         frameoffset, framecount)
+    @assert isformat(fmt, WAVE_FORMAT_IEEE_FLOAT)
+end
+
 
 """
 Convert the underlying wav format to a Julia type that we can
@@ -33,27 +81,33 @@ use to parameterize sources/sinks for type-stable reads and writes.
 """
 function type_from_format(fmt)
     if isformat(fmt, WAVE_FORMAT_PCM)
-        return Fixed{Int16, 15}
+        return Fixed16
     elseif isformat(fmt, WAVE_FORMAT_IEEE_FLOAT)
         return Float32
+    # Companded streams will appear as a 16-bit fixed-point stream, and we'll
+    # compand to/from 8-bit on read/write. The spec says that companded streams
+    # are always 8-bits/sample
     elseif isformat(fmt, WAVE_FORMAT_MULAW)
-        # This stream will appear as a 16-bit fixed-point stream,
-        # and we'll compand to/from 8-bit on read/write
-        return Fixed{Int16, 15}
+        return Fixed16
     elseif isformat(fmt, WAVE_FORMAT_ALAW)
-        return Fixed{Int16, 15}
+        return Fixed16
     else
-        if isextensible(fmt)
-            error("Unrecognized format code (extensible): $(fmt.ext.sub_format)")
-        else
-            error("Unrecognized format code: $(fmt.compression_code)")
-        end
+        throw_fmt_error(fmt)
+    end
+end
+
+function throw_fmt_error(fmt)
+    if isextensible(fmt)
+        error("Unrecognized format code (extensible): $(fmt.ext.sub_format)")
+    else
+        error("Unrecognized format code: $(fmt.compression_code)")
     end
 end
 
 """
 Find the format subchunk, and store up any non-data chunks it finds
-along the way.
+along the way. This function expects the stream to be right after the end
+of a previous chunk, i.e. the next think in the stream is a chunk header.
 """
 function find_format(io, bytesleft)
     opt = Dict{Symbol, Vector{UInt8}}()
@@ -77,7 +131,36 @@ function find_format(io, bytesleft)
     error("Parsed whole file without seeing a fmt chunk")
 end
 
-wavplay(fname) = wavplay(wavread(fname)[1:2]...)
+"""
+Find the next data subchunk, and store up any non-data chunks it finds along the
+way in the given `opt` dictionary. This function expects the stream to be right
+after the end of a previous chunk, i.e. the next think in the stream is a chunk
+header.
+
+Returns the data subchunk size and total remaining file size, with the io stream
+positioned at the beginning of the data (after the header).
+"""
+function find_data(io, opt, bytesleft)
+    while bytesleft > 0
+        (subchunk_id,
+         subchunk_size,
+         bytesleft) = read_subchunk_header(io, bytesleft)
+        if subchunk_id == b"fmt "
+            warning("Got fmt chunk when we did not expect it, skipping...")
+            # throw away the data
+            read(io, subchunk_size)
+            bytesleft -= subchunk_size
+        elseif subchunk_id == b"data"
+            return subchunk_size, bytesleft
+        elseif subchunk_id == b""
+            # corrupt chunk, don't do anything
+        else
+            opt[Symbol(subchunk_id)] = read(io, UInt8, subchunk_size)
+            bytesleft -= subchunk_size
+        end
+    end
+    error("Parsed whole file without seeing a fmt chunk")
+end
 
 # The WAV specification states that numbers are written to disk in little endian form.
 write_le(stream::IO, value) = write(stream, htol(value))
@@ -105,13 +188,16 @@ end
 
 """
 Reads a chunk header from the given stream, assuming that there's the
-given number of bytes remaining in the file.
+given number of bytes remaining in the file. It also does some basic validation
+on the subchunk.
 
 Returns the subchunk ID, subchunk size, and new number of bytes remaining.
 """
 function read_subchunk_header(io::IO, bytesleft)
     if bytesleft < 8
         warn("File ended with partial subchunk header")
+        # throw away the data
+        read(io, bytesleft)
         return b"", 0, 0
     end
     subchunk_id = read(io, UInt8, 4)
@@ -131,60 +217,6 @@ function write_header(io::IO, data_length::UInt32)
 end
 write_standard_header(io, data_length) = write_header(io, UInt32(data_length + 36))
 write_extended_header(io, data_length) = write_header(io, UInt32(data_length + 60))
-
-function read_format(io::IO, chunk_size::UInt32)
-    # can I read in all of the fields at once?
-    orig_chunk_size = convert(Int, chunk_size)
-    if chunk_size < 16
-        error("The WAVE Format chunk must be at least 16 bytes")
-    end
-    const compression_code = read_le(io, UInt16)
-    const nchannels = read_le(io, UInt16)
-    const sample_rate = read_le(io, UInt32)
-    const bytes_per_second = read_le(io, UInt32)
-    const block_align = read_le(io, UInt16)
-    const nbits = read_le(io, UInt16)
-    ext = Array{UInt8, 1}(0)
-    chunk_size -= 16
-    if chunk_size > 0
-        const extra_bytes_length = read_le(io, UInt16)
-        if extra_bytes_length == 22
-            ext = read(io, UInt8, extra_bytes_length)
-        end
-    end
-    return WAVFormat(compression_code,
-                     nchannels,
-                     sample_rate,
-                     bytes_per_second,
-                     block_align,
-                     nbits,
-                     WAVFormatExtension(ext))
-end
-
-function write_format(io::IO, fmt::WAVFormat)
-    len = 16 # 16 is size of base format chunk
-    if isextensible(fmt)
-        len += 24 # 24 is the added length needed to encode the extension
-    end
-    # write the fmt subchunk header
-    write(io, b"fmt ")
-    write_le(io, convert(UInt32, len)) # subchunk length
-
-    write_le(io, fmt.compression_code) # audio format (UInt16)
-    write_le(io, fmt.nchannels) # number of channels (UInt16)
-    write_le(io, fmt.sample_rate) # sample rate (UInt32)
-    write_le(io, fmt.bytes_per_second) # byte rate (UInt32)
-    write_le(io, fmt.block_align) # byte align (UInt16)
-    write_le(io, fmt.nbits) # number of bits per sample (UInt16)
-
-    if isextensible(fmt)
-        write_le(io, convert(UInt16, 22))
-        write_le(io, fmt.ext.nbits)
-        write_le(io, fmt.ext.channel_mask)
-        @assert length(fmt.ext.sub_format) == 16
-        write(io, fmt.ext.sub_format)
-    end
-end
 
 function pcm_container_type(nbits::Unsigned)
     if nbits > 32
@@ -251,7 +283,8 @@ function read_ieee_float_samples(io::IO, fmt::WAVFormat, subrange)
     read_ieee_float_samples(io, fmt, subrange, floatType)
 end
 
-# PCM data is two's-complement except for resolutions of 1-8 bits, which are represented as offset binary.
+# PCM data is two's-complement except for resolutions of 1-8 bits, which are
+# represented as offset binary.
 
 # support every bit width from 1 to 8 bits
 convert_pcm_to_double(samples::AbstractArray{UInt8}, nbits::Integer) = convert(Array{Float64}, samples) ./ (2.0^nbits - 1) .* 2.0 .- 1.0
@@ -531,12 +564,5 @@ wavwrite(y::AbstractArray{Int32}, io::IO) = wavwrite(y, io, nbits=24)
 wavwrite(y::AbstractArray{Int32}, filename::AbstractString) = wavwrite(y, filename, nbits=24)
 wavwrite{T<:AbstractFloat}(y::AbstractArray{T}, io::IO) = wavwrite(y, io, nbits=sizeof(T)*8, compression=WAVE_FORMAT_IEEE_FLOAT)
 wavwrite{T<:AbstractFloat}(y::AbstractArray{T}, filename::AbstractString) = wavwrite(y, filename, nbits=sizeof(T)*8, compression=WAVE_FORMAT_IEEE_FLOAT)
-
-# FileIO integration support
-load(s::Stream{format"WAV"}; kwargs...) = wavread(s.io; kwargs...)
-save(s::Stream{format"WAV"}, data; kwargs...) = wavwrite(data, s.io; kwargs...)
-
-load(f::File{format"WAV"}; kwargs...) = wavread(f.filename; kwargs...)
-save(f::File{format"WAV"}, data; kwargs...) = wavwrite(data, f.filename; kwargs...)
 
 end # module
