@@ -28,7 +28,7 @@ end
 Create a readble audio stream from a WAV file represented by the given io
 stream.
 """
-mutable struct WAVSource{IO, T} <: SampleSource where {IO, T}
+mutable struct WAVSource{IO, T} <: SampleSource
     io::IO
     format::WAVFormat
     opt::Dict{Symbol, Vector{UInt8}}
@@ -55,24 +55,56 @@ Base.eltype(::WAVSource{IO, T}) where {IO, T} = T
 # if the underlying data is companded 8-bit data than we decode it into
 # 16-bit data for the user. If it's 8-bit PCM then we offset it to fit in
 # signed Fixed-point (0-centered). Otherwise it's just a straight copy-out
-function SampledSignals.unsafe_read!(src::WAVSource, buf::Array,
-                                     frameoffset, framecount)
-    bytestoread = framecount * src.fmt.block_align
-    bytestoread = min(bytestoread, src.subchunk_bytesleft)
-    framestoread = div(bytestoread, src.fmt.block_align)
+function SampledSignals.unsafe_read!(src::WAVSource{IO, T}, buf::Array,
+                                     frameoffset, framecount) where IO, T
+    framebytes = src.fmt.block_align
+    samplebytes = div(framebytes, nchannels(src))
+    bytestoread = min(framecount * framebytes, src.subchunk_bytesleft)
+    framestoread = div(bytestoread, framebytes)
+    @assert bytestoread % framebytes == 0
 
     # TODO: pre-allocate this buffer
     rawdata = read(io, bytestoread)
     rawidx = 1
-    # TODO: is this increment always right?
-    increment = div(src.fmt.block_align, nchannels(src))
     for frame in 1:framestoread
         for ch in 1:nchannels(src)
-            buf[frame+frameoffset, ch] = decodesample(src, rawdata, rawidx)
-            rawidx += increment
+            buf[frame+frameoffset, ch] = decodesample(T, rawdata, rawidx,
+                                                      samplebytes)
+            rawidx += samplebytes
         end
     end
 end
+
+# we need special handling for reading into PCM16Samples because we need to
+# check whether we actually have an 8-bit companded stream
+function SampledSignals.unsafe_read!(src::WAVSource{IO, PCM16Sample},
+                                     buf::Array,
+                                     frameoffset, framecount) where IO
+    framebytes = src.fmt.block_align
+    samplebytes = div(framebytes, nchannels(src))
+    bytestoread = min(framecount * framebytes, src.subchunk_bytesleft)
+    framestoread = div(bytestoread, framebytes)
+    @assert bytestoread % framebytes == 0
+
+    # TODO: pre-allocate this buffer
+    rawdata = read(io, bytestoread)
+    rawidx = 1
+    if isformat(src.fmt, WAVE_FORMAT_PCM)
+        # OK, just a normal 16-bit PCM
+        for frame in 1:framestoread
+            for ch in 1:nchannels(src)
+                buf[frame+frameoffset, ch] = decodesample(PCM16Sample, rawdata,
+                                                          rawidx, samplebytes)
+                rawidx += samplebytes
+            end
+        end
+    elseif isformat(src.fmt, WAVE_FORMAT_MULAW)
+    elseif isformat(src.fmt, WAVE_FORMAT_ALAW)
+    else
+        throw_fmt_error(src.fmt)
+    end
+end
+
 
 # decodings:
 # 8-bit PCM: UInt8 -> PCM8Sample (needs offset - `reinterpret(PCM8Sample, x-0x80)`)
@@ -84,21 +116,20 @@ end
 # UInt32 -> Float32 (reinterpret)
 # UInt64 -> Float64 (reinterpret)
 
-# TODO: write some tests for sample decoding
-function decodesample(::Type{Float32}, rawdata, rawidx, nbytes)
-    @assert nbytes == 4
-    intval = decodesample(UInt32, rawdata, rawidx, 4)
-    return reinterpret(Float32, intval)
-end
+"""
+    decodesample(eltype, rawdata, rawidx, nbytes)
 
-function decodesample(::Type{Float64}, rawdata, rawidx, nbytes)
-    @assert nbytes == 8
-    intval = decodesample(UInt64, rawdata, rawidx, 8)
-    return reinterpret(Float64, intval)
-end
+Decode raw bytes read from a wav file into host-endian samples of type `eltype`.
+The data is pulled from the `rawdata` vector, starting at `rawidx`. the `nbytes`
+argument specifies how many bytes the sample takes up in the buffer, and is only
+used for PCM types that can be varying in size (e.g. 24-bit audio takes 3 bytes,
+but the target type is Int32).
+"""
+function decodesample end
 
 decodesample(::Type{UInt8}, rawdata, rawidx, nbytes) = rawdata[rawidx]
 
+# create a native unsigned integer type from the set of bytes
 function decodesample(T::Type{<:Unsigned}, rawdata, rawidx, nbytes)
     # samples are left-justified
     shift = sizeof(T)-nbytes
@@ -107,6 +138,29 @@ function decodesample(T::Type{<:Unsigned}, rawdata, rawidx, nbytes)
         intval |= T(rawdata[rawidx+i]) << ((i+shift)*8)
     end
     return intval
+end
+
+# this doesn't do any companding, it's for PCM 8-bit data. WAV stores 8-bit
+# PCM data in an unsigned byte ranging 0x00-0xFF, so we offset it to a signed
+# fixed-point representation
+function decodesample(::Type{PCM8Sample}, rawdata, rawidx, nbytes)
+    @assert nbytes == 1
+    return reinterpret(PCM8Sample, rawdata[rawidx]-0x80)
+end
+
+# a bunch of other target types come from just building a unsigned integer type
+# and then reinterpreting is as the target type. Use some metaprogramming
+# to define all these methods
+for (targettype, inttype) in (
+        (Float32, UInt32),
+        (Float64, UInt64),
+        (PCM16Sample, UInt16),
+        (PCM32Sample, UInt32),
+        (PCM64Sample, UInt64))
+    @eval function decodesample(::Type{$targettype}, rawdata, rawidx, nbytes)
+        intval = decodesample($inttype, rawdata, rawidx, nbytes)
+        return reinterpret($targettype, intval)
+    end
 end
 
 """
