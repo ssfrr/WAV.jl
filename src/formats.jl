@@ -1,14 +1,3 @@
-# Required WAV Chunk; The format chunk describes how the waveform data is stored
-struct WAVFormat
-    compression_code::UInt16
-    nchannels::UInt16
-    sample_rate::UInt32
-    bytes_per_second::UInt32 # average bytes per second
-    block_align::UInt16
-    nbits::UInt16
-    ext::WAVFormatExtension
-end
-
 # used by WAVE_FORMAT_EXTENSIBLE
 struct WAVFormatExtension
     nbits::UInt16 # overrides nbits in WAVFormat type
@@ -28,6 +17,17 @@ function WAVFormatExtension(bytes)
     channel_mask = (convert(UInt32, bytes[6]) << 24) | (convert(UInt32, bytes[5]) << 16) | (convert(UInt32, bytes[4]) << 8) | convert(UInt32, bytes[3])
     sub_format = bytes[7:end]
     return WAVFormatExtension(valid_bits_per_sample, channel_mask, sub_format)
+end
+
+# Required WAV Chunk; The format chunk describes how the waveform data is stored
+struct WAVFormat
+    compression_code::UInt16
+    nchannels::UInt16
+    sample_rate::UInt32
+    bytes_per_second::UInt32 # average bytes per second
+    block_align::UInt16
+    nbits::UInt16
+    ext::WAVFormatExtension
 end
 
 const WAVE_FORMAT_PCM        = 0x0001 # PCM
