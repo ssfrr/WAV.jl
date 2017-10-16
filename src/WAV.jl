@@ -4,7 +4,11 @@ export WAVSink, WAVSource
 export WAVFormatExtension, WAVFormat
 export WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_ALAW, WAVE_FORMAT_MULAW
 using FileIO
-using SampledSignals
+import SampledSignals
+using SampledSignals: SampleSource, SampleSink, nchannels
+using SampledSignals: PCM8Sample, PCM16Sample, PCM32Sample, PCM64Sample
+
+using FixedPointNumbers: Fixed
 
 include("formats.jl")
 include("companding.jl")
@@ -44,35 +48,38 @@ function WAVSource(io)
     subchunk_bytesleft, bytesleft = find_data(io, opt, bytesleft)
 
     # now we have a WAVSource ready to provide audio data
-    WAVSource{eltype, typeof(io)}(io, fmt, opt, bytesleft, subchunk_bytesleft)
+    WAVSource{typeof(io), eltype}(io, fmt, opt, bytesleft, subchunk_bytesleft)
 end
 
-SampledSignals.nchannels(src::WAVSource) = Int(src.fmt.nchannels)
-SampledSignals.samplerate(src::WAVSource) = float(src.fmt.sample_rate)
+SampledSignals.nchannels(src::WAVSource) = Int(src.format.nchannels)
+SampledSignals.samplerate(src::WAVSource) = float(src.format.sample_rate)
 Base.eltype(::WAVSource{IO, T}) where {IO, T} = T
+
 # SampledSignals.nframes(src::WAVSource)
 
 # if the underlying data is companded 8-bit data than we decode it into
 # 16-bit data for the user. If it's 8-bit PCM then we offset it to fit in
 # signed Fixed-point (0-centered). Otherwise it's just a straight copy-out
 function SampledSignals.unsafe_read!(src::WAVSource{IO, T}, buf::Array,
-                                     frameoffset, framecount) where IO, T
-    framebytes = src.fmt.block_align
+                                     frameoffset, framecount) where {IO, T}
+    framebytes = src.format.block_align
     samplebytes = div(framebytes, nchannels(src))
     bytestoread = min(framecount * framebytes, src.subchunk_bytesleft)
     framestoread = div(bytestoread, framebytes)
     @assert bytestoread % framebytes == 0
 
     # TODO: pre-allocate this buffer
-    rawdata = read(io, bytestoread)
+    rawdata = read(src.io, bytestoread)
     rawidx = 1
     for frame in 1:framestoread
         for ch in 1:nchannels(src)
-            buf[frame+frameoffset, ch] = decodesample(T, rawdata, rawidx,
-                                                      samplebytes)
+            buf[frame+frameoffset, ch] = decodewavbytes(T, rawdata, rawidx,
+                                                        samplebytes)
             rawidx += samplebytes
         end
     end
+
+    framestoread
 end
 
 # we need special handling for reading into PCM16Samples because we need to
@@ -80,29 +87,35 @@ end
 function SampledSignals.unsafe_read!(src::WAVSource{IO, PCM16Sample},
                                      buf::Array,
                                      frameoffset, framecount) where IO
-    framebytes = src.fmt.block_align
+    framebytes = src.format.block_align
     samplebytes = div(framebytes, nchannels(src))
     bytestoread = min(framecount * framebytes, src.subchunk_bytesleft)
     framestoread = div(bytestoread, framebytes)
     @assert bytestoread % framebytes == 0
 
     # TODO: pre-allocate this buffer
-    rawdata = read(io, bytestoread)
+    rawdata = read(src.io, bytestoread)
     rawidx = 1
-    if isformat(src.fmt, WAVE_FORMAT_PCM)
-        # OK, just a normal 16-bit PCM
-        for frame in 1:framestoread
-            for ch in 1:nchannels(src)
-                buf[frame+frameoffset, ch] = decodesample(PCM16Sample, rawdata,
-                                                          rawidx, samplebytes)
-                rawidx += samplebytes
+    # TODO: if we move the branch outside the loop the code will be
+    # a little uglier but it may be a little faster
+    for frame in 1:framestoread
+        for ch in 1:nchannels(src)
+            if isformat(src.format, WAVE_FORMAT_PCM)
+                # OK, just a normal 16-bit PCM
+                buf[frame+frameoffset, ch] = decodewavbytes(PCM16Sample, rawdata,
+                                                            rawidx, samplebytes)
+            elseif isformat(src.format, WAVE_FORMAT_MULAW)
+                buf[frame+frameoffset, ch] = decodemulaw(rawdata[rawidx])
+            elseif isformat(src.format, WAVE_FORMAT_ALAW)
+                buf[frame+frameoffset, ch] = decodealaw(rawdata[rawidx])
+            else
+                throw_fmt_error(src.format)
             end
+            rawidx += samplebytes
         end
-    elseif isformat(src.fmt, WAVE_FORMAT_MULAW)
-    elseif isformat(src.fmt, WAVE_FORMAT_ALAW)
-    else
-        throw_fmt_error(src.fmt)
     end
+
+    framestoread
 end
 
 
@@ -117,48 +130,72 @@ end
 # UInt64 -> Float64 (reinterpret)
 
 """
-    decodesample(eltype, rawdata, rawidx, nbytes)
+    decodewavbytes(eltype, rawdata, rawidx, nbytes)
 
 Decode raw bytes read from a wav file into host-endian samples of type `eltype`.
 The data is pulled from the `rawdata` vector, starting at `rawidx`. the `nbytes`
 argument specifies how many bytes the sample takes up in the buffer, and is only
 used for PCM types that can be varying in size (e.g. 24-bit audio takes 3 bytes,
 but the target type is Int32).
+
+These functions should be type-stable and fast, so they can be called in an
+inner loop.
 """
-function decodesample end
+function decodewavbytes end
 
-decodesample(::Type{UInt8}, rawdata, rawidx, nbytes) = rawdata[rawidx]
+decodewavbytes(::Type{UInt8}, rawdata, rawidx, nbytes) = rawdata[rawidx]
 
-# create a native unsigned integer type from the set of bytes
-function decodesample(T::Type{<:Unsigned}, rawdata, rawidx, nbytes)
-    # samples are left-justified
-    shift = sizeof(T)-nbytes
+# create a native unsigned integer type from the raw bytes
+function decodewavbytes(T::Type{<:Unsigned}, rawdata, rawidx, nbytes)
+    # samples are left-justified in the file
+    shift = sizeof(T) - nbytes
+    # first construct the native value (left-aligned)
     intval = zero(T)
     for i in 0:(nbytes-1)
         intval |= T(rawdata[rawidx+i]) << ((i+shift)*8)
     end
-    return intval
+    intval
 end
 
-# this doesn't do any companding, it's for PCM 8-bit data. WAV stores 8-bit
-# PCM data in an unsigned byte ranging 0x00-0xFF, so we offset it to a signed
-# fixed-point representation
-function decodesample(::Type{PCM8Sample}, rawdata, rawidx, nbytes)
+# we represent PCM values as right-justified fixed-point.
+for (signed, unsigned) in [
+        (Int16, UInt16),
+        (Int32, UInt32),
+        (Int64, UInt64)]
+    @eval function decodewavbytes(::Type{Fixed{$signed, f}}, rawdata, rawidx, nbytes) where {f}
+        # first decode to the left-justified unsigned int of the correct width
+        intval = decodewavbytes($unsigned, rawdata, rawidx, nbytes)
+        signedval = reinterpret($signed, intval)
+        # f is the number of fractional bits, plus a sign bit
+        nbits = f+1
+        # now shift it (preserving the sign bit) so it's right-aligned
+        return reinterpret(Fixed{$signed, f}, signedval >> (sizeof($unsigned)*8-nbits))
+    end
+end
+
+# this doesn't do any companding, it's for PCM 8-bit-or-smaller data. WAV
+# stores 8-bit PCM data in an unsigned byte ranging 0x00-0xFF, so we offset it
+# to a signed fixed-point representation. If the value is smaller than 8 bits it
+# will be right-aligned.
+function decodewavbytes(::Type{Fixed{Int8, f}}, rawdata, rawidx, nbytes) where {f}
     @assert nbytes == 1
-    return reinterpret(PCM8Sample, rawdata[rawidx]-0x80)
+    nbits = f+1
+    signedval = reinterpret(Int8, rawdata[rawidx]-0x80)
+    return reinterpret(Fixed{Int8, f}, signedval >> (8-nbits))
 end
 
 # a bunch of other target types come from just building a unsigned integer type
 # and then reinterpreting is as the target type. Use some metaprogramming
-# to define all these methods
+# to define all these methods. You can't reinterpret directly from a UIntX type
+# into a fixed-point, so we go UInt -> Int -> Fixed
 for (targettype, inttype) in (
         (Float32, UInt32),
         (Float64, UInt64),
-        (PCM16Sample, UInt16),
-        (PCM32Sample, UInt32),
-        (PCM64Sample, UInt64))
-    @eval function decodesample(::Type{$targettype}, rawdata, rawidx, nbytes)
-        intval = decodesample($inttype, rawdata, rawidx, nbytes)
+        (Int16, UInt16),
+        (Int32, UInt64),
+        (Int64, UInt64))
+    @eval function decodewavbytes(::Type{$targettype}, rawdata, rawidx, nbytes)
+        intval = decodewavbytes($inttype, rawdata, rawidx, nbytes)
         return reinterpret($targettype, intval)
     end
 end
@@ -166,19 +203,39 @@ end
 """
 Convert the underlying wav format to a Julia type that we can
 use to parameterize sources/sinks for type-stable reads and writes.
+
+Companded streams are represented as 16-bit fixed-point because that's the
+user-facing representation.
 """
 function type_from_format(fmt)
+    nbits = bits_per_sample(fmt)
     if isformat(fmt, WAVE_FORMAT_PCM)
-        return Fixed16
+        if nbits <= 8
+            return Fixed{Int8, nbits-1}
+        elseif nbits <= 16
+            return Fixed{Int16, nbits-1}
+        elseif nbits <= 32
+            return Fixed{Int32, nbits-1}
+        elseif nbits <= 64
+            return Fixed{Int64, nbits-1}
+        else
+            error("Only support PCM up to 64-bit")
+        end
     elseif isformat(fmt, WAVE_FORMAT_IEEE_FLOAT)
-        return Float32
+        if nbits == 32
+            return Float32
+        elseif nbits == 64
+            return Float64
+        else
+            error("FORMAT_IEEE_FLOAT only supports 32 and 64-bit floats")
+        end
     # Companded streams will appear as a 16-bit fixed-point stream, and we'll
     # compand to/from 8-bit on read/write. The spec says that companded streams
     # are always 8-bits/sample
     elseif isformat(fmt, WAVE_FORMAT_MULAW)
-        return Fixed16
+        return PCM16Sample
     elseif isformat(fmt, WAVE_FORMAT_ALAW)
-        return Fixed16
+        return PCM16Sample
     else
         throw_fmt_error(fmt)
     end
@@ -234,7 +291,7 @@ function find_data(io, opt, bytesleft)
          subchunk_size,
          bytesleft) = read_subchunk_header(io, bytesleft)
         if subchunk_id == b"fmt "
-            warning("Got fmt chunk when we did not expect it, skipping...")
+            warn("Got fmt chunk when we did not expect it, skipping...")
             # throw away the data
             skip(io, subchunk_size)
             bytesleft -= subchunk_size
@@ -298,13 +355,13 @@ function read_subchunk_header(io::IO, bytesleft)
     return subchunk_id, subchunk_size, bytesleft
 end
 
-function write_header(io::IO, data_length::UInt32)
+function write_header(io::IO, databytes)
     write(io, b"RIFF") # RIFF header
-    write_le(io, data_length) # chunk_size
+    write_le(io, databytes) # chunk_size
     write(io, b"WAVE")
 end
-write_standard_header(io, data_length) = write_header(io, UInt32(data_length + 36))
-write_extended_header(io, data_length) = write_header(io, UInt32(data_length + 60))
+write_standard_header(io, databytes) = write_header(io, UInt32(databytes + 36))
+write_extended_header(io, databytes) = write_header(io, UInt32(databytes + 60))
 
 function pcm_container_type(nbits)
     if nbits > 32
@@ -328,96 +385,7 @@ function ieee_float_container_type(nbits)
     error("$nbits bits is not supported for WAVE_FORMAT_IEEE_FLOAT.")
 end
 
-function read_pcm_samples(io::IO, fmt::WAVFormat, subrange)
-    const nbits = bits_per_sample(fmt)
-    if isempty(subrange)
-        return Array{pcm_container_type(nbits), 2}(0, fmt.nchannels)
-    end
-    samples = Array{pcm_container_type(nbits), 2}(length(subrange), fmt.nchannels)
-    sample_type = eltype(samples)
-    const nbytes = ceil(Integer, nbits / 8)
-    const bitshift = [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38, 0x40]
-    mask = UInt64(0x1) << (nbits - 1)
-    if nbits <= 8
-        mask = UInt64(0)
-    end
-    skip(io, convert(UInt, (first(subrange) - 1) * nbytes * fmt.nchannels))
-    for i = 1:size(samples, 1)
-        for j = 1:size(samples, 2)
-            raw_sample = read(io, UInt8, nbytes)
-            my_sample = UInt64(0)
-            for k = 1:nbytes
-                my_sample |= convert(UInt64, raw_sample[k]) << bitshift[k]
-            end
-            my_sample >>= nbytes * 8 - nbits
-            # sign extend negative values
-            my_sample = xor(my_sample, mask) - mask
-            samples[i, j] = convert(sample_type, signed(my_sample))
-        end
-    end
-    samples
-end
-
-function read_ieee_float_samples(io::IO, fmt::WAVFormat, subrange, floatType)
-    if isempty(subrange)
-        return Array{floatType, 2}(0, fmt.nchannels)
-    end
-    const nblocks = length(subrange)
-    samples = Array{floatType, 2}(nblocks, fmt.nchannels)
-    const nbits = bits_per_sample(fmt)
-    skip(io, convert(UInt, (first(subrange) - 1) * (nbits / 8) * fmt.nchannels))
-    for i = 1:nblocks
-        for j = 1:fmt.nchannels
-            samples[i, j] = read_le(io, floatType)
-        end
-    end
-    samples
-end
-
-# take the loop variable type out of the loop
-function read_ieee_float_samples(io::IO, fmt::WAVFormat, subrange)
-    const floatType = ieee_float_container_type(bits_per_sample(fmt))
-    read_ieee_float_samples(io, fmt, subrange, floatType)
-end
-
-# PCM data is two's-complement except for resolutions of 1-8 bits, which are
-# represented as offset binary.
-
-# support every bit width from 1 to 8 bits
-convert_pcm_to_double(samples::AbstractArray{UInt8}, nbits::Integer) = convert(Array{Float64}, samples) ./ (2.0^nbits - 1) .* 2.0 .- 1.0
-convert_pcm_to_double(::AbstractArray{Int8}, ::Integer) = error("WAV files use offset binary for less than 9 bits")
-# support every bit width from 9 to 64 bits
-convert_pcm_to_double{T<:Signed}(samples::AbstractArray{T}, nbits::Integer) = convert(Array{Float64}, samples) / (2.0^(nbits - 1) - 1)
-
-function read_data(io::IO, chunk_size, fmt::WAVFormat, format, subrange)
-    # "format" is the format of values, while "fmt" is the WAV file level format
-    convert_to_double = x -> convert(Array{Float64}, x)
-
-    if subrange === Void
-        # each block stores fmt.nchannels channels
-        subrange = 1:convert(UInt, chunk_size / fmt.block_align)
-    end
-    if isformat(fmt, WAVE_FORMAT_PCM)
-        samples = read_pcm_samples(io, fmt, subrange)
-        convert_to_double = x -> convert_pcm_to_double(x, bits_per_sample(fmt))
-    elseif isformat(fmt, WAVE_FORMAT_IEEE_FLOAT)
-        samples = read_ieee_float_samples(io, fmt, subrange)
-    elseif isformat(fmt, WAVE_FORMAT_MULAW)
-        samples = read_mulaw_samples(io, fmt, subrange)
-        convert_to_double = x -> convert_pcm_to_double(x, 16)
-    elseif isformat(fmt, WAVE_FORMAT_ALAW)
-        samples = read_alaw_samples(io, fmt, subrange)
-        convert_to_double = x -> convert_pcm_to_double(x, 16)
-    else
-        error("$(fmt.compression_code) is an unsupported compression code!")
-    end
-    if format == "double"
-        samples = convert_to_double(samples)
-    end
-    samples
-end
-
-function write_pcm_samples{T<:Integer}(io::IO, fmt::WAVFormat, samples::AbstractArray{T})
+function write_pcm_samples(io::IO, fmt::WAVFormat, samples::AbstractArray{<:Integer})
     const nbits = bits_per_sample(fmt)
     # number of bytes per sample
     const nbytes = ceil(Integer, nbits / 8)
@@ -434,7 +402,7 @@ function write_pcm_samples{T<:Integer}(io::IO, fmt::WAVFormat, samples::Abstract
     end
 end
 
-function write_pcm_samples{T<:AbstractFloat}(io::IO, fmt::WAVFormat, samples::AbstractArray{T})
+function write_pcm_samples(io::IO, fmt::WAVFormat, samples::AbstractArray{<:AbstractFloat})
     const nbits = bits_per_sample(fmt)
     # Scale the floating point values to the PCM range
     if nbits > 8
@@ -479,48 +447,6 @@ end
 make_range(subrange) = subrange
 make_range(subrange::Number) = 1:convert(Int, subrange)
 
-function wavread(io::IO; subrange=Void, format="double")
-    chunk_size = read_header(io)
-    samples = Array{Float64, 1}()
-    nbits = 0
-    sample_rate = Float32(0.0)
-    opt = Dict{Symbol, Any}()
-
-    # Note: This assumes that the format chunk is written in the file before the data chunk. The
-    # specification does not require this assumption, but most real files are written that way.
-
-    # Subtract the size of the format field from chunk_size; now it holds the size
-    # of all the sub-chunks
-    chunk_size -= 4
-    # GitHub Issue #18: Check if there is enough data to read another chunk
-    const subchunk_header_size = 4 + sizeof(UInt32)
-    while chunk_size >= subchunk_header_size
-        # Read subchunk ID and size
-        subchunk_id = read(io, UInt8, 4)
-        subchunk_size = read_le(io, UInt32)
-        if subchunk_size > chunk_size
-            chunk_size = 0
-            break
-        end
-        chunk_size -= subchunk_header_size + subchunk_size
-        # check the subchunk ID
-        if subchunk_id == b"fmt "
-            fmt = read_format(io, subchunk_size)
-            sample_rate = Float32(fmt.sample_rate)
-            nbits = bits_per_sample(fmt)
-            opt[:fmt] = fmt
-        elseif subchunk_id == b"data"
-            if format == "size"
-                return convert(Int, subchunk_size / fmt.block_align), convert(Int, fmt.nchannels)
-            end
-            samples = read_data(io, subchunk_size, fmt, format, make_range(subrange))
-        else
-            opt[Symbol(subchunk_id)] = read(io, UInt8, subchunk_size)
-        end
-    end
-    return samples, sample_rate, nbits, opt
-end
-
 function wavread(filename::AbstractString; subrange=Void, format="double")
     open(filename, "r") do io
         wavread(io, subrange=subrange, format=format)
@@ -532,8 +458,8 @@ wavread(filename::AbstractString, fmt::AbstractString) = wavread(filename, forma
 wavread(filename::AbstractString, n) = wavread(filename, subrange=n)
 wavread(filename::AbstractString, n, fmt) = wavread(filename, subrange=n, format=fmt)
 
-get_default_compression{T<:Integer}(::AbstractArray{T}) = WAVE_FORMAT_PCM
-get_default_compression{T<:AbstractFloat}(::AbstractArray{T}) = WAVE_FORMAT_IEEE_FLOAT
+get_default_compression(::AbstractArray{<:Integer}) = WAVE_FORMAT_PCM
+get_default_compression(::AbstractArray{<:AbstractFloat}) = WAVE_FORMAT_IEEE_FLOAT
 get_default_pcm_precision(::AbstractArray{UInt8}) = 8
 get_default_pcm_precision(::AbstractArray{Int16}) = 16
 get_default_pcm_precision(::Any) = 24
@@ -655,11 +581,11 @@ wavwrite(y::AbstractArray, f::Real, filename::AbstractString) = wavwrite(y, file
 wavwrite(y::AbstractArray, f::Real, n::Real, filename::AbstractString) = wavwrite(y, filename, Fs=f, nbits=n)
 
 # support for writing native arrays...
-wavwrite{T<:Integer}(y::AbstractArray{T}, io::IO) = wavwrite(y, io, nbits=sizeof(T)*8)
-wavwrite{T<:Integer}(y::AbstractArray{T}, filename::AbstractString) = wavwrite(y, filename, nbits=sizeof(T)*8)
+wavwrite(y::AbstractArray{T}, io::IO) where T <: Integer = wavwrite(y, io, nbits=sizeof(T)*8)
+wavwrite(y::AbstractArray{T}, filename::AbstractString) where T <: Integer = wavwrite(y, filename, nbits=sizeof(T)*8)
 wavwrite(y::AbstractArray{Int32}, io::IO) = wavwrite(y, io, nbits=24)
 wavwrite(y::AbstractArray{Int32}, filename::AbstractString) = wavwrite(y, filename, nbits=24)
-wavwrite{T<:AbstractFloat}(y::AbstractArray{T}, io::IO) = wavwrite(y, io, nbits=sizeof(T)*8, compression=WAVE_FORMAT_IEEE_FLOAT)
-wavwrite{T<:AbstractFloat}(y::AbstractArray{T}, filename::AbstractString) = wavwrite(y, filename, nbits=sizeof(T)*8, compression=WAVE_FORMAT_IEEE_FLOAT)
+wavwrite(y::AbstractArray{T}, io::IO) where T <: AbstractFloat = wavwrite(y, io, nbits=sizeof(T)*8, compression=WAVE_FORMAT_IEEE_FLOAT)
+wavwrite(y::AbstractArray{T}, filename::AbstractString) where T <: AbstractFloat = wavwrite(y, filename, nbits=sizeof(T)*8, compression=WAVE_FORMAT_IEEE_FLOAT)
 
 end # module

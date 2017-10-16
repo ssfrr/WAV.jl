@@ -39,10 +39,10 @@ const WAVE_FORMAT_EXTENSIBLE = 0xfffe # Extension!
 isextensible(fmt::WAVFormat) = (fmt.compression_code == WAVE_FORMAT_EXTENSIBLE)
 bits_per_sample(fmt::WAVFormat) = isextensible(fmt) ? fmt.ext.nbits : fmt.nbits
 
-function read_format(io::IO, chunk_size::UInt32)
+function read_format(io::IO, chunkbytes)
     # can I read in all of the fields at once?
-    orig_chunk_size = convert(Int, chunk_size)
-    if chunk_size < 16
+    orig_chunk_size = convert(Int, chunkbytes)
+    if chunkbytes < 16
         error("The WAVE Format chunk must be at least 16 bytes")
     end
     const compression_code = read_le(io, UInt16)
@@ -52,8 +52,8 @@ function read_format(io::IO, chunk_size::UInt32)
     const block_align = read_le(io, UInt16)
     const nbits = read_le(io, UInt16)
     ext = Array{UInt8, 1}(0)
-    chunk_size -= 16
-    if chunk_size > 0
+    chunkbytes -= 16
+    if chunkbytes > 0
         const extra_bytes_length = read_le(io, UInt16)
         if extra_bytes_length == 22
             ext = read(io, UInt8, extra_bytes_length)
