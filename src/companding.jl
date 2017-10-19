@@ -1,5 +1,5 @@
-decodemulaw(encoded) = reinterpret(PCM16Sample, mudecode_table[encoded+1])
-decodealaw(encoded) = reinterpret(PCM16Sample, adecode_table[encoded+1])
+decodemulaw(encoded) = reinterpret(Fixed{Int16, 15}, mudecode_table[encoded+1])
+decodealaw(encoded) = reinterpret(Fixed{Int16, 15}, adecode_table[encoded+1])
 
 function encodemulaw(sample)
     cBias = 0x84

@@ -6,6 +6,8 @@ using FileIO: load, save
 using SampledSignals: SampleBuf, nchannels, samplerate, nframes
 using SampledSignals: PCM8Sample, PCM16Sample, PCM20Sample, PCM24Sample, PCM32Sample, PCM64Sample
 
+using Suppressor: @capture_err, @color_output
+
 @testset ExtendedTestSet "WAV.jl Tests" begin
     include("reading.jl")
 end

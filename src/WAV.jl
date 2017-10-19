@@ -4,10 +4,11 @@ module WAV
 export WAVSink, WAVSource
 export WAVFormatExtension, WAVFormat
 export WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_ALAW, WAVE_FORMAT_MULAW
+
 using FileIO
 import SampledSignals
 using SampledSignals: SampleSource, SampleSink, nchannels
-using SampledSignals: PCM8Sample, PCM16Sample, PCM32Sample, PCM64Sample
+using Nulls: null, isnull
 
 using FixedPointNumbers: Fixed
 
@@ -15,11 +16,13 @@ include("formats.jl")
 include("companding.jl")
 include("fileio.jl")
 
+const SUBCHUNK_HEADER_SIZE = 8
+
 """
     WAVSink(io) # TODO: kwargs here!
 
-Create a writable audio stream that will write WAV-formatted data to the given
-io stream.
+A writable audio stream that writes to a WAV file represented by the given io
+stream.
 """
 mutable struct WAVSink{IO} <: SampleSink where IO
     io::IO
@@ -30,26 +33,31 @@ end
 """
     WAVSource(io)
 
-Create a readble audio stream from a WAV file represented by the given io
-stream.
+A readble audio stream that reads from a WAV file represented by the given
+io stream. The stream will accumulate metadata chunks as it reads through
+the file, which you can access with the `metadata` function. Note that if the
+file has any metadata chunks after the data chunk in the file, they won't be
+available until the whole file is read.
 """
 mutable struct WAVSource{IO, T} <: SampleSource
     io::IO
     format::WAVFormat
     opt::Dict{Symbol, Vector{UInt8}}
-    bytesleft::Int
-    subchunk_bytesleft::Int
+    file_bytesleft::Int
+    data_bytesleft::Int
 end
 
+# This method reads the WAV header and everything up to the "data" chunk,
+# leaving the stream ready to be read from.
 function WAVSource(io)
-    bytesleft = read_wave_header(io)
+    bytesleft = read_header(io)
     fmt, opt, bytesleft = find_format(io, bytesleft)
     eltype = type_from_format(fmt)
     # read into the stream until we find the data
-    subchunk_bytesleft, bytesleft = find_data(io, opt, bytesleft)
+    data_bytesleft, bytesleft = find_data(io, opt, bytesleft)
 
     # now we have a WAVSource ready to provide audio data
-    WAVSource{typeof(io), eltype}(io, fmt, opt, bytesleft, subchunk_bytesleft)
+    WAVSource{typeof(io), eltype}(io, fmt, opt, bytesleft, data_bytesleft)
 end
 
 SampledSignals.nchannels(src::WAVSource) = Int(src.format.nchannels)
@@ -58,65 +66,93 @@ Base.eltype(::WAVSource{IO, T}) where {IO, T} = T
 
 # SampledSignals.nframes(src::WAVSource)
 
-# if the underlying data is companded 8-bit data than we decode it into
-# 16-bit data for the user. If it's 8-bit PCM then we offset it to fit in
-# signed Fixed-point (0-centered). Otherwise it's just a straight copy-out
-function SampledSignals.unsafe_read!(src::WAVSource{IO, T}, buf::Array,
-                                     frameoffset, framecount) where {IO, T}
+function SampledSignals.unsafe_read!(src::WAVSource, buf::Array,
+                                     frameoffset, framecount)
     framebytes = src.format.block_align
     samplebytes = div(framebytes, nchannels(src))
-    bytestoread = min(framecount * framebytes, src.subchunk_bytesleft)
-    framestoread = div(bytestoread, framebytes)
-    @assert bytestoread % framebytes == 0
+    bytestoread = if isnull(src.data_bytesleft)
+            framecount * framebytes
+        else
+            min(framecount * framebytes, src.data_bytesleft)
+        end
 
     # TODO: pre-allocate this buffer
     rawdata = read(src.io, bytestoread)
-    rawidx = 1
-    for frame in 1:framestoread
-        for ch in 1:nchannels(src)
-            buf[frame+frameoffset, ch] = decodewavbytes(T, rawdata, rawidx,
-                                                        samplebytes)
-            rawidx += samplebytes
+    bytesread = length(rawdata)
+    if bytesread < bytestoread
+        # got EOF while reading
+        src.file_bytesleft -= 0
+        src.data_bytesleft -= 0
+    else
+        src.file_bytesleft -= bytesread
+        src.data_bytesleft -= bytesread
+    end
+    framesread = div(bytesread, framebytes)
+
+    copy_samples(buf, rawdata, src.format, frameoffset, framesread, samplebytes)
+
+    if src.data_bytesleft < framebytes
+        # we've reached the end of the data chunk
+        if src.data_bytesleft > 0
+            warn("\"data\" chunk had $(src.data_bytesleft) orphaned bytes")
+            skip(src.io, src.data_bytesleft)
+            src.file_bytesleft -= src.data_bytesleft
+            src.data_bytesleft = 0
         end
+
+        # grab any of the chunks that follow
+        parse_tail(src.io, src.opt, src.data_bytesleft)
     end
 
-    framestoread
+    framesread
 end
 
-# we need special handling for reading into PCM16Samples because we need to
-# check whether we actually have an 8-bit companded stream
-function SampledSignals.unsafe_read!(src::WAVSource{IO, PCM16Sample},
-                                     buf::Array,
-                                     frameoffset, framecount) where IO
-    framebytes = src.format.block_align
-    samplebytes = div(framebytes, nchannels(src))
-    bytestoread = min(framecount * framebytes, src.subchunk_bytesleft)
-    framestoread = div(bytestoread, framebytes)
-    @assert bytestoread % framebytes == 0
-
-    # TODO: pre-allocate this buffer
-    rawdata = read(src.io, bytestoread)
+"""
+    function copy_samples(dest, src,
+                        format, frameoffset, framecount,
+                        samplebytes)
+Copy the samples from `src` (the raw UInt8 buffer from the stream) into `dest`
+(the array used for unsafe_read)
+"""
+function copy_samples(dest::Array{T, N}, src,
+                      format, frameoffset, framecount,
+                      samplebytes) where {T, N}
     rawidx = 1
-    # TODO: if we move the branch outside the loop the code will be
-    # a little uglier but it may be a little faster
-    for frame in 1:framestoread
-        for ch in 1:nchannels(src)
-            if isformat(src.format, WAVE_FORMAT_PCM)
-                # OK, just a normal 16-bit PCM
-                buf[frame+frameoffset, ch] = decodewavbytes(PCM16Sample, rawdata,
-                                                            rawidx, samplebytes)
-            elseif isformat(src.format, WAVE_FORMAT_MULAW)
-                buf[frame+frameoffset, ch] = decodemulaw(rawdata[rawidx])
-            elseif isformat(src.format, WAVE_FORMAT_ALAW)
-                buf[frame+frameoffset, ch] = decodealaw(rawdata[rawidx])
-            else
-                throw_fmt_error(src.format)
-            end
+    for frame in (1:framecount) + frameoffset
+        for ch in 1:size(dest, 2)
+            dest[frame, ch] = decodewavbytes(T, src, rawidx, samplebytes)
             rawidx += samplebytes
         end
     end
+end
 
-    framestoread
+# we need special handling for reading into 16-bit because we need to
+# check whether we actually have an 8-bit companded stream
+function copy_samples(dest::Array{Fixed{Int16, 15}, N}, src,
+                      format, frameoffset, framecount,
+                      samplebytes) where N
+    rawidx = 1
+    if isformat(format, WAVE_FORMAT_PCM)
+        # OK, just a normal 16-bit PCM
+        for frame in (1:framecount) + frameoffset, ch in 1:size(dest, 2)
+            dest[frame, ch] = decodewavbytes(Fixed{Int16, 15}, src, rawidx, 2)
+            rawidx += 2
+        end
+    elseif isformat(format, WAVE_FORMAT_MULAW)
+        for frame in (1:framecount) + frameoffset, ch in 1:size(dest, 2)
+            dest[frame, ch] = decodemulaw(src[rawidx])
+            rawidx += 1
+        end
+    elseif isformat(format, WAVE_FORMAT_ALAW)
+        for frame in (1:framecount) + frameoffset, ch in 1:size(dest, 2)
+            dest[frame, ch] = decodealaw(src[rawidx])
+            rawidx += 1
+        end
+    else
+        throw_fmt_error(format)
+    end
+
+    framecount
 end
 
 
@@ -234,9 +270,9 @@ function type_from_format(fmt)
     # compand to/from 8-bit on read/write. The spec says that companded streams
     # are always 8-bits/sample
     elseif isformat(fmt, WAVE_FORMAT_MULAW)
-        return PCM16Sample
+        return Fixed{Int16, 15}
     elseif isformat(fmt, WAVE_FORMAT_ALAW)
-        return PCM16Sample
+        return Fixed{Int16, 15}
     else
         throw_fmt_error(fmt)
     end
@@ -257,24 +293,50 @@ of a previous chunk, i.e. the next think in the stream is a chunk header.
 """
 function find_format(io, bytesleft)
     opt = Dict{Symbol, Vector{UInt8}}()
-    while bytesleft > 0
+    while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
         (subchunk_id,
          subchunk_size,
          bytesleft) = read_subchunk_header(io, bytesleft)
         if subchunk_id == b"fmt "
-            format = read_format(io, subchunk_size)
-            bytesleft -= subchunk_size
+            format, bytesleft = read_format(io, subchunk_size, bytesleft)
             return format, opt, bytesleft
+        elseif subchunk_id == b""
+            # got EOF reading the header
+            break
         elseif subchunk_id == b"data"
             error("Got data chunk before fmt chunk")
-        elseif subchunk_id == b""
-            # corrupt chunk, don't do anything
         else
-            opt[Symbol(subchunk_id)] = read(io, UInt8, subchunk_size)
-            bytesleft -= subchunk_size
+            opt[Symbol(subchunk_id)], bytesleft = read_subchunk(io,
+                                                                subchunk_size,
+                                                                bytesleft)
         end
     end
     error("Parsed whole file without seeing a fmt chunk")
+end
+
+"""
+Parse whatever is left in the WAV file and store any chunks in the given
+`opt` dict.
+"""
+function parse_tail(io, opt, bytesleft)
+    while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
+        (subchunk_id,
+         subchunk_size,
+         bytesleft) = read_subchunk_header(io, bytesleft)
+        if subchunk_id == b"fmt " || subchunk_id == b"data"
+            warn("Got extra $(String(subchunk_id)) chunk, skipping...")
+            # throw away the data
+            _, bytesleft = read_subchunk(io, subchunk_size, bytesleft)
+        elseif subchunk_id == b""
+            # got EOF reading the header, bytesleft is now 0
+        else
+            opt[Symbol(subchunk_id)], bytesleft = read_subchunk(io,
+                                                                subchunk_size,
+                                                                bytesleft)
+        end
+    end
+
+    nothing
 end
 
 """
@@ -287,51 +349,81 @@ Returns the data subchunk size and total remaining file size, with the io stream
 positioned at the beginning of the data (after the header).
 """
 function find_data(io, opt, bytesleft)
-    while bytesleft > 0
+    while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
         (subchunk_id,
          subchunk_size,
          bytesleft) = read_subchunk_header(io, bytesleft)
         if subchunk_id == b"fmt "
-            warn("Got fmt chunk when we did not expect it, skipping...")
+            warn("Got extra fmt chunk, skipping...")
             # throw away the data
-            skip(io, subchunk_size)
-            bytesleft -= subchunk_size
+            _, bytesleft = read_subchunk(io, subchunk_size, bytesleft)
         elseif subchunk_id == b"data"
             return subchunk_size, bytesleft
         elseif subchunk_id == b""
-            # corrupt chunk, don't do anything
+            # got EOF while reading subchunk header, bytesleft is now 0
         else
-            opt[Symbol(subchunk_id)] = read(io, UInt8, subchunk_size)
-            bytesleft -= subchunk_size
+            opt[Symbol(subchunk_id)], bytesleft = read_subchunk(io,
+                                                                subchunk_size,
+                                                                bytesleft)
         end
     end
-    error("Parsed whole file without seeing a fmt chunk")
+    error("Parsed whole file without seeing a data chunk")
+end
+
+function read_subchunk(io, size, bytesleft)
+    data = read(io, size)
+    if length(data) < size
+        warn("Got EOF reading subchunk payload")
+        bytesleft = 0
+    else
+        bytesleft -= size
+        if isodd(size)
+            # consume the padding byte
+            skip(io, 1)
+            bytesleft > 0 && (bytesleft -= 1)
+        end
+    end
+
+    data, bytesleft
 end
 
 # The WAV specification states that numbers are written to disk in little endian form.
 write_le(stream::IO, value) = write(stream, htol(value))
 read_le(stream::IO, x::Type) = ltoh(read(stream, x))
 
-function read_wave_header(io::IO)
+"""
+    read_header(io)
+
+Read the RIFF and WAVE headers from the given `io` object
+"""
+function read_header(io::IO)
     # check if the given file has a valid RIFF header
     riff = Array{UInt8}(4)
     read!(io, riff)
     if riff !=  b"RIFF"
-        error("Invalid WAV file: The RIFF header is invalid")
+        error("Invalid RIFF file: got \"$(String(riff))\", expected \"RIFF\"")
     end
 
     chunk_size = Int(read_le(io, UInt32))
+    if chunk_size == 0 || chunk_size == 0xffffffff
+        warn("Illegal size $chunk_size in RIFF header. Reading until EOF")
+        chunk_size = null
+    elseif isodd(chunk_size)
+        warn("Odd size $chunk_size in RIFF header, adding padding byte")
+        # assume we should add a padding byte, but this is a sketchy situation
+        chunk_size += 1
+    end
 
     # check if this is a WAV file
     format = Array{UInt8}(4)
     read!(io, format)
+    chunk_size -= 4
     if format != b"WAVE"
-        error("Invalid WAV file: the format is not WAVE")
+        error("Invalid WAV file: got \"$(String(format))\", expected \"WAVE\"")
     end
-    # the given file size doesn't include the "RIFF" and "WAVE" strings,
-    # but does include the 32-bit file size field itself, so we want
-    # to compensate for that
-    return chunk_size - 4
+    # the given file size is does not include the 8-byte RIFF header, but does
+    # include the WAVE string that came next
+    return chunk_size
 end
 
 """
@@ -342,17 +434,16 @@ on the subchunk.
 Returns the subchunk ID, subchunk size, and new number of bytes remaining.
 """
 function read_subchunk_header(io::IO, bytesleft)
-    if bytesleft < 8
-        warn("File ended with partial subchunk header")
-        # throw away the data
-        read(io, bytesleft)
-        return b"", 0, 0
-    end
-    subchunk_id = read(io, UInt8, 4)
-    subchunk_size = Int(read_le(io, UInt32))
+    subchunk_id, subchunk_size = try
+            read(io, UInt8, 4), Int(read_le(io, UInt32))
+        catch ex
+            ex isa EOFError || rethrow()
+            warn("Got EOF reading subchunk header")
+            return b"", 0, 0
+        end
     bytesleft -= 8
-    if subchunk_size > bytesleft
-        warn("File ended with partial subchunk data")
+    if !isnull(bytesleft) && subchunk_size > bytesleft
+        warn("Subchunk \"$(String(subchunk_id))\" claims to be longer than RIFF chunk length. Truncating...")
         subchunk_size = bytesleft
     end
     return subchunk_id, subchunk_size, bytesleft
@@ -365,18 +456,6 @@ function write_header(io::IO, databytes)
 end
 write_standard_header(io, databytes) = write_header(io, UInt32(databytes + 36))
 write_extended_header(io, databytes) = write_header(io, UInt32(databytes + 60))
-
-function pcm_container_type(nbits)
-    if nbits > 32
-        return PCM64Sample
-    elseif nbits > 16
-        return PCM32Sample
-    elseif nbits > 8
-        return PCM16Sample
-    end
-
-    return  PCM8Sample
-end
 
 function ieee_float_container_type(nbits)
     if nbits == 32
@@ -546,40 +625,40 @@ function wavwrite(samples::AbstractArray, filename::AbstractString; Fs=8000, nbi
     end
 end
 
-function wavappend(samples::AbstractArray, io::IO)
-    seekstart(io)
-    chunk_size = read_header(io)
-    subchunk_id = Array{UInt8}(4)
-    read!(io, subchunk_id)
-    subchunk_size = read_le(io, UInt32)
-    if subchunk_id != b"fmt "
-        error("First chunk is not the format")
-    end
-    fmt = read_format(io, subchunk_size)
+# function wavappend(samples::AbstractArray, io::IO)
+#     seekstart(io)
+#     chunk_size = read_header(io)
+#     subchunk_id = Array{UInt8}(4)
+#     read!(io, subchunk_id)
+#     subchunk_size = read_le(io, UInt32)
+#     if subchunk_id != b"fmt "
+#         error("First chunk is not the format")
+#     end
+#     fmt = read_format(io, subchunk_size)
 
-    if fmt.nchannels != size(samples,2)
-        error("Number of channels do not match")
-    end
+#     if fmt.nchannels != size(samples,2)
+#         error("Number of channels do not match")
+#     end
 
-    data_length = size(samples, 1) * fmt.block_align
+#     data_length = size(samples, 1) * fmt.block_align
 
-    seek(io,4)
-    write_le(io, convert(UInt32, chunk_size + data_length))
+#     seek(io,4)
+#     write_le(io, convert(UInt32, chunk_size + data_length))
 
-    seek(io,64)
-    subchunk_size = read_le(io, UInt32)
-    seek(io,64)
-    write_le(io, convert(UInt32, subchunk_size + data_length))
+#     seek(io,64)
+#     subchunk_size = read_le(io, UInt32)
+#     seek(io,64)
+#     write_le(io, convert(UInt32, subchunk_size + data_length))
 
-    seekend(io)
-    write_data(io, fmt, samples)
-end
+#     seekend(io)
+#     write_data(io, fmt, samples)
+# end
 
-function wavappend(samples::AbstractArray, filename::AbstractString)
-    open(filename, "a+") do io
-        wavappend(samples,io)
-    end
-end
+# function wavappend(samples::AbstractArray, filename::AbstractString)
+#     open(filename, "a+") do io
+#         wavappend(samples,io)
+#     end
+# end
 
 wavwrite(y::AbstractArray, f::Real, filename::AbstractString) = wavwrite(y, filename, Fs=f)
 wavwrite(y::AbstractArray, f::Real, n::Real, filename::AbstractString) = wavwrite(y, filename, Fs=f, nbits=n)

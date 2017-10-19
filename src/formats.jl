@@ -41,9 +41,7 @@ const WAVE_FORMAT_EXTENSIBLE = 0xfffe # Extension!
 isextensible(fmt::WAVFormat) = (fmt.compression_code == WAVE_FORMAT_EXTENSIBLE)
 bits_per_sample(fmt::WAVFormat) = isextensible(fmt) ? fmt.ext.nbits : fmt.nbits
 
-function read_format(io::IO, chunkbytes)
-    # can I read in all of the fields at once?
-    orig_chunk_size = convert(Int, chunkbytes)
+function read_format(io::IO, chunkbytes, bytesleft)
     if chunkbytes < 16
         error("The WAVE Format chunk must be at least 16 bytes")
     end
@@ -53,12 +51,16 @@ function read_format(io::IO, chunkbytes)
     const bytes_per_second = read_le(io, UInt32)
     const block_align = read_le(io, UInt16)
     const nbits = read_le(io, UInt16)
-    ext = Array{UInt8, 1}(0)
+    ext = Vector{UInt8}(0)
+    bytesleft -= 16
     chunkbytes -= 16
     if chunkbytes > 0
         const extra_bytes_length = read_le(io, UInt16)
+        bytesleft -= 2
         if extra_bytes_length == 22
             ext = read(io, UInt8, extra_bytes_length)
+            length(ext) == extra_bytes_length || throw(EOFError())
+            bytesleft -= extra_bytes_length
         end
     end
     return WAVFormat(compression_code,
@@ -67,7 +69,8 @@ function read_format(io::IO, chunkbytes)
                      bytes_per_second,
                      block_align,
                      nbits,
-                     WAVFormatExtension(ext))
+                     WAVFormatExtension(ext)),
+           bytesleft
 end
 
 function write_format(io::IO, fmt::WAVFormat)
