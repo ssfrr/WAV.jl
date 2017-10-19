@@ -80,6 +80,12 @@ function SampledSignals.unsafe_read!(src::WAVSource, buf::Array,
     bytesread = length(rawdata)
     if bytesread < bytestoread
         # got EOF while reading
+        if(!isnull(src.file_bytesleft))
+            warn("reached EOF but RIFF header indicated more data")
+        end
+        if(!isnull(src.data_bytesleft))
+            warn("reached EOF but data chunk header indicated more data")
+        end
         src.file_bytesleft -= 0
         src.data_bytesleft -= 0
     else
@@ -100,7 +106,7 @@ function SampledSignals.unsafe_read!(src::WAVSource, buf::Array,
         end
 
         # grab any of the chunks that follow
-        parse_tail(src.io, src.opt, src.data_bytesleft)
+        parse_tail(src.io, src.opt, src.file_bytesleft)
     end
 
     framesread
@@ -435,7 +441,7 @@ function read_subchunk_header(io::IO, bytesleft)
             read(io, UInt8, 4), Int(read_le(io, UInt32))
         catch ex
             ex isa EOFError || rethrow()
-            warn("Got EOF reading subchunk header")
+            warn("Got EOF expecting subchunk header")
             return b"", 0, 0
         end
     bytesleft -= 8
