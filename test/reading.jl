@@ -1,5 +1,7 @@
 @testset "File Reading" begin
     AUDIODIR = joinpath(@__DIR__, "audio")
+    loadtestfile(filename) = WAV.load(FileIO.query(joinpath(AUDIODIR, filename)))
+
     expected_frames = 100
     expected_channels = 2
     expected_samplerate = 48000
@@ -19,7 +21,7 @@
             (PCM32Sample, "48000_stereo_pcm32.wav"),
             ]
         @testset "$filename" begin
-            loaded = WAV.load(FileIO.query(joinpath(AUDIODIR, filename)))
+            loaded = loadtestfile(filename)
             @test loaded isa SampleBuf
             @test eltype(loaded) == T
             @test nchannels(loaded) == expected_channels
@@ -36,7 +38,7 @@
             (PCM16Sample, "48000_stereo_ulaw.wav"),
             ]
         @testset "$filename" begin
-            loaded = WAV.load(FileIO.query(joinpath(AUDIODIR, filename)))
+            loaded = loadtestfile(filename)
             @test loaded isa SampleBuf
             @test eltype(loaded) == T
             @test nchannels(loaded) == expected_channels
@@ -61,7 +63,7 @@
         @testset "$filename" begin
             @color_output false begin
                 output = @capture_err begin
-                    loaded = WAV.load(FileIO.query(joinpath(AUDIODIR, filename)))
+                    loaded = loadtestfile(filename)
                 end
             end
             @test output == expected_output
@@ -71,6 +73,39 @@
             @test samplerate(loaded) == expected_samplerate
             @test nframes(loaded) == expected_frames
             @test loaded ≈ map(T, expected_data)
+        end
+    end
+
+    # these files have odd-sized chunks, to verify padding is handled properly
+    for (T, filename) in [
+            (PCM16Sample, "Pmiscck.wav"),
+            (PCM16Sample, "Ptjunk.wav"), # also has some trailing garbage
+            ]
+        @testset "$filename" begin
+            loaded = loadtestfile(filename)
+            @test loaded isa SampleBuf
+            @test eltype(loaded) == T
+            @test nchannels(loaded) == 1
+            @test samplerate(loaded) == 8000
+            @test nframes(loaded) == 9
+        end
+    end
+
+    # this file has a variety of chunk types, including two `DISP` chunks
+    @testset "Utopia Critical Stop.wav" begin
+        open(joinpath(AUDIODIR, "Utopia Critical Stop.WAV")) do io
+            src = WAVSource(io)
+            # read from it to make sure we've parsed all the chunks
+            read(src)
+            @test typeof(metadata(src, :LIST)) == Vector{UInt8}
+
+            # by default we get the first one if there are duplicates
+            @test typeof(metadata(src, :DISP)) == Vector{UInt8}
+            # we can get a list of them by indexing with `:`
+            @test length(metadata(src, :DISP, :)) == 2
+            # we can access elements of the list by giving an index
+            @test typeof(metadata(src, :DISP, 1)) == Vector{UInt8}
+            @test typeof(metadata(src, :DISP, 2)) == Vector{UInt8}
         end
     end
 end

@@ -42,7 +42,7 @@ available until the whole file is read.
 mutable struct WAVSource{IO, T} <: SampleSource
     io::IO
     format::WAVFormat
-    opt::Dict{Symbol, Vector{UInt8}}
+    opt::Dict{Symbol, Vector{Vector{UInt8}}}
     file_bytesleft::Int
     data_bytesleft::Int
 end
@@ -63,6 +63,25 @@ end
 SampledSignals.nchannels(src::WAVSource) = Int(src.format.nchannels)
 SampledSignals.samplerate(src::WAVSource) = float(src.format.sample_rate)
 Base.eltype(::WAVSource{IO, T}) where {IO, T} = T
+
+SampledSignals.metadata(src::WAVSource, key) = src.opt[key][1]
+SampledSignals.metadata(src::WAVSource, key, ::Colon) = src.opt[key]
+SampledSignals.metadata(src::WAVSource, key, idx) = src.opt[key][idx]
+
+"""
+    pushmetadata(opt, key, val)
+
+Push the given metadata chunk `opt`, which is a dictionary of vectors of
+metadata chunks.
+"""
+function pushmetadata(opt, key, val)
+    symbkey = Symbol(strip(String(key)))
+    if symbkey in keys(opt)
+        push!(opt[symbkey], val)
+    else
+        opt[symbkey] = [val]
+    end
+end
 
 # SampledSignals.nframes(src::WAVSource)
 
@@ -298,7 +317,7 @@ along the way. This function expects the stream to be right after the end
 of a previous chunk, i.e. the next think in the stream is a chunk header.
 """
 function find_format(io, bytesleft)
-    opt = Dict{Symbol, Vector{UInt8}}()
+    opt = Dict{Symbol, Vector{Vector{UInt8}}}()
     while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
         (subchunk_id,
          subchunk_size,
@@ -312,9 +331,8 @@ function find_format(io, bytesleft)
         elseif subchunk_id == b"data"
             error("Got data chunk before fmt chunk")
         else
-            opt[Symbol(subchunk_id)], bytesleft = read_subchunk(io,
-                                                                subchunk_size,
-                                                                bytesleft)
+            chunkdata, bytesleft = read_subchunk(io, subchunk_size, bytesleft)
+            pushmetadata(opt, subchunk_id, chunkdata)
         end
     end
     error("Parsed whole file without seeing a fmt chunk")
@@ -336,9 +354,8 @@ function parse_tail(io, opt, bytesleft)
         elseif subchunk_id == b""
             # got EOF reading the header, bytesleft is now 0
         else
-            opt[Symbol(subchunk_id)], bytesleft = read_subchunk(io,
-                                                                subchunk_size,
-                                                                bytesleft)
+            chunkdata, bytesleft = read_subchunk(io, subchunk_size, bytesleft)
+            pushmetadata(opt, subchunk_id, chunkdata)
         end
     end
 
@@ -368,9 +385,8 @@ function find_data(io, opt, bytesleft)
         elseif subchunk_id == b""
             # got EOF while reading subchunk header, bytesleft is now 0
         else
-            opt[Symbol(subchunk_id)], bytesleft = read_subchunk(io,
-                                                                subchunk_size,
-                                                                bytesleft)
+            chunkdata, bytesleft = read_subchunk(io, subchunk_size, bytesleft)
+            pushmetadata(opt, subchunk_id, chunkdata)
         end
     end
     error("Parsed whole file without seeing a data chunk")
