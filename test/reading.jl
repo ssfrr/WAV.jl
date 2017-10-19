@@ -48,17 +48,16 @@
 
     # these are malformed in various ways
     for (T, filename, expected_output) in [
-            # (
-            #     PCM16Sample,
-            #     "48000_stereo_pcm16_long_filelength.wav",
-            #     "WARNING: File shorter than RIFF chunk indicated"
-            # ),
-            # (
-            #     PCM16Sample,
-            #     "48000_stereo_pcm16_long_datalength.wav",
-            #     "WARNING: Data chunk claims to be longer than RIFF chunk. Truncating..."
-            # )
-            ]
+            (
+                PCM16Sample,
+                "48000_stereo_pcm16_long_filelength.wav",
+                "WARNING: Got EOF expecting subchunk header\n"
+            ),
+            (
+                PCM16Sample,
+                "48000_stereo_pcm16_long_datalength.wav",
+                "WARNING: Subchunk \"data\" claims to be longer than RIFF chunk length. Truncating...\n"
+            )]
         @testset "$filename" begin
             @color_output false begin
                 output = @capture_err begin
