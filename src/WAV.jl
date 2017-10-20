@@ -82,8 +82,8 @@ function pushmetadata(opt, key, val)
     end
 end
 
-# SampledSignals.nframes(src::WAVSource)
-
+# implement SampledSignals's read method to plug into the stream conversion
+# infrastructure
 function SampledSignals.unsafe_read!(src::WAVSource, buf::Array,
                                      frameoffset, framecount)
     framebytes = src.format.block_align
@@ -362,13 +362,15 @@ function parse_tail(io, opt, bytesleft)
 end
 
 """
-Find the next data subchunk, and store up any non-data chunks it finds along the
-way in the given `opt` dictionary. This function expects the stream to be right
-after the end of a previous chunk, i.e. the next think in the stream is a chunk
-header.
+    find_data(io, opt, bytesleft)
 
-Returns the data subchunk size and total remaining file size, with the io stream
-positioned at the beginning of the data (after the header).
+Find the data subchunk, and store up any non-data chunks it finds along the
+way in the given `opt` dictionary. This function expects the stream to be
+right after the end of a previous chunk, i.e. the next think in the stream is
+a chunk header.
+
+Returns the data subchunk size and total remaining file size, with the io
+stream positioned at the beginning of the data (after the header).
 """
 function find_data(io, opt, bytesleft)
     while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
@@ -391,6 +393,12 @@ function find_data(io, opt, bytesleft)
     error("Parsed whole file without seeing a data chunk")
 end
 
+"""
+    read_subchunk(io, size, bytesleft)
+
+Read the subchunk payload with the given `size` in bytes, assuming that there
+are `bytesleft` bytes left in the stream.
+"""
 function read_subchunk(io, size, bytesleft)
     data = read(io, size)
     if length(data) < size
@@ -446,9 +454,11 @@ function read_header(io::IO)
 end
 
 """
-Reads a chunk header from the given stream, assuming that there's the
-given number of bytes remaining in the file. It also does some basic validation
-on the subchunk.
+    read_subchunk_header(io, bytesleft)
+
+Reads a subchunk header from the given stream, assuming that there's the
+given number of bytes remaining in the file. It also does some basic
+validation on the subchunk.
 
 Returns the subchunk ID, subchunk size, and new number of bytes remaining.
 """
