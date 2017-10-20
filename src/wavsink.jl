@@ -30,7 +30,7 @@ function ieee_float_container_type(nbits)
 end
 
 function write_pcm_samples(io::IO, fmt::WAVFormat, samples::AbstractArray{<:Integer})
-    const nbits = bits_per_sample(fmt)
+    nbits = bits_per_sample(fmt)
     # number of bytes per sample
     nbytes = ceil(Integer, nbits / 8)
     for i = 1:size(samples, 1)
