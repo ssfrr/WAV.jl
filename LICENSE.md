@@ -1,6 +1,6 @@
 The WAV.jl package is licensed under the MIT Expat License:
 
-> Copyright (c) 2013: Daniel C. Casimiro.
+> Copyright (c) 2013: Daniel C. Casimiro, Spencer Russell, and [others](https://github.com/dancasimiro/WAV.jl/graphs/contributors)
 >
 > Permission is hereby granted, free of charge, to any person obtaining
 > a copy of this software and associated documentation files (the
