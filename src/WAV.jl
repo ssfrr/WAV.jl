@@ -12,6 +12,11 @@ using Nulls: null, isnull
 
 using FixedPointNumbers: Fixed
 
+# chunks are keyed by their ID, e.g. `b"data"`. We do this rather than using
+# `Symbol`s so we can capture spaces, e.g. `b"cue "`
+const ChunkKey = Vector{UInt8}
+const SUBCHUNK_HEADER_SIZE = 8
+
 include("util.jl")
 include("formats.jl")
 include("companding.jl")

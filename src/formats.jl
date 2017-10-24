@@ -4,10 +4,11 @@ struct WAVFormatExtension
     channel_mask::UInt32
     sub_format::Array{UInt8, 1} # 16 byte GUID
 
-    WAVFormatExtension() = new(0, 0, Array{UInt8, 1}(0))
+    WAVFormatExtension() = new(0, 0, Vector{UInt8}(0))
     WAVFormatExtension(nb, cm, sb) = new(nb, cm, sb)
 end
 
+# read a WAVFormatExtension from raw bytes
 function WAVFormatExtension(bytes)
     if isempty(bytes)
         return WAVFormatExtension()
@@ -18,6 +19,8 @@ function WAVFormatExtension(bytes)
     sub_format = bytes[7:end]
     return WAVFormatExtension(valid_bits_per_sample, channel_mask, sub_format)
 end
+
+const COMPRESSIONS = (:none, :mulaw, :alaw)
 
 # Required WAV Chunk; The format chunk describes how the waveform data is stored
 struct WAVFormat
@@ -32,14 +35,135 @@ struct WAVFormat
     WAVFormat(cc, nchan, fs, bps, ba, nb, e) = new(cc, nchan, fs, bps, ba, nb, e)
 end
 
+function WAVFormat(eltype, nchannels, samplerate, compression)
+    fmtcode, ext_fmtcode = formatcodes(eltype, nchannels, compression)
+    containerbytes = ceil(Int, validbits(eltype) / 8)
+    blockalign = containerbytes * nchannels
+    bps = samplerate * blockalign
+    ext = if needs_extensible(eltype, nchannels)
+            WAVFormatExtension(validbits(eltype), 0, ext_fmtcode)
+        else
+            WAVFormatExtension()
+        end
+    
+    WAVFormat(fmtcode, nchannels, samplerate, bps, blockalign,
+              containerbytes*8, ext)
+end
+
+function Base.show(io::IO, fmt::WAVFormat)
+    println(io, "WAVFormat")
+    println(io, "  compression_code: $(formatname(fmt.compression_code))")
+    println(io, "  nchannels: $(fmt.nchannels)")
+    println(io, "  sample_rate: $(fmt.sample_rate)")
+    println(io, "  bits_per_second: $(fmt.bytes_per_second)")
+    println(io, "  block_align: $(fmt.block_align)")
+    println(io, "  nbits: $(fmt.nbits)")
+    if isextensible(fmt)
+        println(io, "  extended data:")
+        println(io, "    valid_bits_per_sample: $(fmt.ext.valid_bits_per_sample)")
+        println(io, "    channel_mask: $(fmt.ext.channel_mask)")
+        println(io, "    sub_format: $(subformatname(fmt.ext.valid_bits_per_sample))")
+    end
+end
+
+function needs_extensible(eltype, nchannels)
+    # criteria from http://www-mmsp.ece.mcgill.ca/Documents/AudioFormats/WAVE/WAVE.html
+    if nchannels > 2
+        true
+    end
+    # if pcm data is > 16bit or doesn't fit evenly into its container size
+    if eltype <: Fixed && (validbits(eltype) > 16 || validbits(eltype) % 8 != 0)
+        true
+    end
+
+    false
+end
+
+"""
+    formatcodes(eltype, channels, compression)
+
+Returns the normal and extended format codes appropriate for the given
+parameters.
+"""
+function formatcodes(eltype, nchannels, compression)
+    if needs_extensible(eltype, nchannels)
+        if eltype <: AbstractFloat && compression == :none
+            WAVE_FORMAT_EXTENSIBLE, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        elseif eltype <: Fixed && compression == :none
+            WAVE_FORMAT_EXTENSIBLE, KSDATAFORMAT_SUBTYPE_PCM
+        elseif eltype == Fixed{Int16, 15} && compression == :alaw
+            WAVE_FORMAT_EXTENSIBLE, KSDATAFORMAT_SUBTYPE_ALAW
+        elseif eltype == Fixed{Int16, 15} && compression == :mulaw
+            WAVE_FORMAT_EXTENSIBLE, KSDATAFORMAT_SUBTYPE_MULAW
+        else
+            error("Invalid eltype, nchannel, compression combination: $eltype, $nchannels, $compression")
+        end
+    else
+        if eltype <: AbstractFloat && compression == :none
+            WAVE_FORMAT_IEEE_FLOAT, nothing
+        elseif eltype <: Fixed && compression == :none
+            WAVE_FORMAT_PCM, nothing
+        elseif eltype == Fixed{Int16, 15} && compression == :alaw
+            WAVE_FORMAT_ALAW, nothing
+        elseif eltype == Fixed{Int16, 15} && compression == :mulaw
+            WAVE_FORMAT_MULAW, nothing
+        else
+            error("Invalid eltype, nchannel, compression combination: $eltype, $nchannels, $compression")
+        end
+    end
+end
+
 const WAVE_FORMAT_PCM        = 0x0001 # PCM
 const WAVE_FORMAT_IEEE_FLOAT = 0x0003 # IEEE float
 const WAVE_FORMAT_ALAW       = 0x0006 # A-Law
 const WAVE_FORMAT_MULAW      = 0x0007 # Mu-Law
 const WAVE_FORMAT_EXTENSIBLE = 0xfffe # Extension!
 
+function formatname(code)
+    if code == WAVE_FORMAT_PCM
+        "WAVE_FORMAT_PCM"
+    elseif code == WAVE_FORMAT_IEEE_FLOAT
+        "WAVE_FORMAT_IEEE_FLOAT"
+    elseif code == WAVE_FORMAT_IEEE_ALAW
+        "WAVE_FORMAT_IEEE_ALAW"
+    elseif code == WAVE_FORMAT_IEEE_MULAW
+        "WAVE_FORMAT_IEEE_MULAW"
+    elseif code == WAVE_FORMAT_IEEE_EXTENSIBLE
+        "WAVE_FORMAT_IEEE_EXTENSIBLE"
+    else
+        "Unknown format $code"
+    end
+end
+
+function subformatname(code)
+    if code == KSDATAFORMAT_SUBTYPE_PCM
+        "KSDATAFORMAT_SUBTYPE_PCM"
+    elseif code == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        "KSDATAFORMAT_SUBTYPE_IEEE_FLOAT"
+    elseif code == KSDATAFORMAT_SUBTYPE_IEEE_ALAW
+        "KSDATAFORMAT_SUBTYPE_IEEE_ALAW"
+    elseif code == KSDATAFORMAT_SUBTYPE_IEEE_MULAW
+        "KSDATAFORMAT_SUBTYPE_IEEE_MULAW"
+    elseif code == KSDATAFORMAT_SUBTYPE_IEEE_EXTENSIBLE
+        "KSDATAFORMAT_SUBTYPE_IEEE_EXTENSIBLE"
+    else
+        "Unknown subformat $code"
+    end
+end
+
 isextensible(fmt::WAVFormat) = (fmt.compression_code == WAVE_FORMAT_EXTENSIBLE)
-bits_per_sample(fmt::WAVFormat) = isextensible(fmt) ? fmt.ext.nbits : fmt.nbits
+
+"""
+    validbits(x::WAVFormat)
+    validbits(x::Type)
+
+Return the number of valid bits per sample in the given WAV format block or
+Julia type.
+"""
+validbits(fmt::WAVFormat) = isextensible(fmt) ? fmt.ext.nbits : fmt.nbits
+validbits(::Type{<:Fixed{T, f}}) where {T, f} = f+1
+validbits(::Type{Float32}) = 32
+validbits(::Type{Float64}) = 64
 
 function read_format(io::IO, chunkbytes, bytesleft)
     if chunkbytes < 16
@@ -96,6 +220,9 @@ function write_format(io::IO, fmt::WAVFormat)
         @assert length(fmt.ext.sub_format) == 16
         write(io, fmt.ext.sub_format)
     end
+
+    # return the number of bytes written
+    len+8
 end
 
 

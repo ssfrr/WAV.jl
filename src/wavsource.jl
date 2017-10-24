@@ -10,7 +10,7 @@ available until the whole file is read.
 mutable struct WAVSource{IO, T} <: SampleSource
     io::IO
     format::WAVFormat
-    opt::Dict{Symbol, Vector{Vector{UInt8}}}
+    opt::Dict{String, Vector{Vector{UInt8}}}
     file_bytesleft::Int
     data_bytesleft::Int
 end
@@ -36,14 +36,17 @@ SampledSignals.metadata(src::WAVSource, key) = src.opt[key][1]
 SampledSignals.metadata(src::WAVSource, key, ::Colon) = src.opt[key]
 SampledSignals.metadata(src::WAVSource, key, idx) = src.opt[key][idx]
 
-const SUBCHUNK_HEADER_SIZE = 8
+# These are the MATLAB compatible signatures
+wavread(filename::AbstractString, fmt::AbstractString) = wavread(filename, format=fmt)
+wavread(filename::AbstractString, n) = wavread(filename, subrange=n)
+wavread(filename::AbstractString, n, fmt) = wavread(filename, subrange=n, format=fmt)
 
 # implement SampledSignals's read method to plug into the stream conversion
 # infrastructure
 function SampledSignals.unsafe_read!(src::WAVSource, buf::Array,
                                      frameoffset, framecount)
     framebytes = src.format.block_align
-    samplebytes = div(framebytes, nchannels(src))
+    samplebytes = framebytes ÷ nchannels(src)
     bytestoread = if isnull(src.data_bytesleft)
             framecount * framebytes
         else
@@ -67,9 +70,9 @@ function SampledSignals.unsafe_read!(src::WAVSource, buf::Array,
         src.file_bytesleft -= bytesread
         src.data_bytesleft -= bytesread
     end
-    framesread = div(bytesread, framebytes)
+    framesread = bytesread ÷ framebytes
 
-    copy_samples(buf, rawdata, src.format, frameoffset, framesread, samplebytes)
+    decode_buffer(buf, rawdata, src.format, frameoffset, framesread, samplebytes)
 
     if src.data_bytesleft < framebytes
         # we've reached the end of the data chunk
@@ -88,15 +91,15 @@ function SampledSignals.unsafe_read!(src::WAVSource, buf::Array,
 end
 
 """
-    function copy_samples(dest, src,
-                        format, frameoffset, framecount,
-                        samplebytes)
+    function decode_buffer(dest, src,
+                           format, frameoffset, framecount,
+                           samplebytes)
 Copy the samples from `src` (the raw UInt8 buffer from the stream) into `dest`
 (the array used for unsafe_read)
 """
-function copy_samples(dest::Array{T, N}, src,
-                      format, frameoffset, framecount,
-                      samplebytes) where {T, N}
+function decode_buffer(dest::Array{T, N}, src,
+                       format, frameoffset, framecount,
+                       samplebytes) where {T, N}
     rawidx = 1
     for frame in (1:framecount) + frameoffset
         for ch in 1:size(dest, 2)
@@ -108,9 +111,9 @@ end
 
 # we need special handling for reading into 16-bit because we need to
 # check whether we actually have an 8-bit companded stream
-function copy_samples(dest::Array{Fixed{Int16, 15}, N}, src,
-                      format, frameoffset, framecount,
-                      samplebytes) where N
+function decode_buffer(dest::Array{Fixed{Int16, 15}, N}, src,
+                       format, frameoffset, framecount,
+                       samplebytes) where N
     rawidx = 1
     if isformat(format, WAVE_FORMAT_PCM)
         # OK, just a normal 16-bit PCM
@@ -217,47 +220,6 @@ for (targettype, inttype) in (
     end
 end
 
-"""
-Convert the underlying wav format to a Julia type that we can
-use to parameterize sources/sinks for type-stable reads and writes.
-
-Companded streams are represented as 16-bit fixed-point because that's the
-user-facing representation.
-"""
-function type_from_format(fmt)
-    nbits = bits_per_sample(fmt)
-    if isformat(fmt, WAVE_FORMAT_PCM)
-        if nbits <= 8
-            return Fixed{Int8, nbits-1}
-        elseif nbits <= 16
-            return Fixed{Int16, nbits-1}
-        elseif nbits <= 32
-            return Fixed{Int32, nbits-1}
-        elseif nbits <= 64
-            return Fixed{Int64, nbits-1}
-        else
-            error("Only support PCM up to 64-bit")
-        end
-    elseif isformat(fmt, WAVE_FORMAT_IEEE_FLOAT)
-        if nbits == 32
-            return Float32
-        elseif nbits == 64
-            return Float64
-        else
-            error("FORMAT_IEEE_FLOAT only supports 32 and 64-bit floats")
-        end
-    # Companded streams will appear as a 16-bit fixed-point stream, and we'll
-    # compand to/from 8-bit on read/write. The spec says that companded streams
-    # are always 8-bits/sample
-    elseif isformat(fmt, WAVE_FORMAT_MULAW)
-        return Fixed{Int16, 15}
-    elseif isformat(fmt, WAVE_FORMAT_ALAW)
-        return Fixed{Int16, 15}
-    else
-        throw_fmt_error(fmt)
-    end
-end
-
 function throw_fmt_error(fmt)
     if isextensible(fmt)
         error("Unrecognized format code (extensible): $(fmt.ext.sub_format)")
@@ -272,7 +234,7 @@ along the way. This function expects the stream to be right after the end
 of a previous chunk, i.e. the next think in the stream is a chunk header.
 """
 function find_format(io, bytesleft)
-    opt = Dict{Symbol, Vector{Vector{UInt8}}}()
+    opt = Dict{String, Vector{Vector{UInt8}}}()
     while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
         (subchunk_id,
          subchunk_size,
