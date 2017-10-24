@@ -236,7 +236,7 @@ of a previous chunk, i.e. the next think in the stream is a chunk header.
 """
 function find_format(io, bytesleft)
     opt = Dict{ChunkKey, Vector{Vector{UInt8}}}()
-    while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
+    while isnull(bytesleft) || bytesleft >= SUBCHUNK_HEADER_SIZE
         (subchunk_id,
          subchunk_size,
          bytesleft) = read_subchunk_header(io, bytesleft)
@@ -268,7 +268,7 @@ Returns the data subchunk size and total remaining file size, with the io
 stream positioned at the beginning of the data (after the header).
 """
 function find_data(io, opt, bytesleft)
-    while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
+    while isnull(bytesleft) || bytesleft >= SUBCHUNK_HEADER_SIZE
         (subchunk_id,
          subchunk_size,
          bytesleft) = read_subchunk_header(io, bytesleft)
@@ -293,7 +293,7 @@ Parse whatever is left in the WAV file and store any chunks in the given
 `opt` dict.
 """
 function parse_tail(io, opt, bytesleft)
-    while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
+    while isnull(bytesleft) || bytesleft >= SUBCHUNK_HEADER_SIZE
         (subchunk_id,
          subchunk_size,
          bytesleft) = read_subchunk_header(io, bytesleft)

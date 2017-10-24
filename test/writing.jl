@@ -37,6 +37,65 @@
             end
         end
     end
+
+    @testset "Compression" begin
+        freqs = [480, 960]
+        sig = sin.(2pi*freqs' .* (0:99)/48000) * 0.3
+        for comp in [:mulaw, :alaw]
+            @testset "$comp" begin
+                io = IOBuffer()
+                WAVSink(io, compression=comp) do sink
+                    write(sink, sig)
+                    @test eltype(sink) == Fixed{Int16, 15}
+                end
+                seek(io, 0)
+                WAVSource(io) do src
+                    @test eltype(src) == Fixed{Int16, 15}
+                    @test isapprox(read(src), sig, rtol=0.045)
+                end
+            end
+        end
+    end
+
+    @testset "Writing zero-sample file" begin
+        # io = IOBuffer()
+        io = open("/tmp/zero.wav", "w+")
+        WAVSink(io) do sink
+        end
+        seek(io, 0)
+        WAVSource(io) do src
+            # this will throw an error if there was no data chunk
+            # TODO: add a test to the reader to ensure that this is true
+        end
+        close(io)
+    end
+
+    @testset "Reading/Writing Chunks" begin
+        io = IOBuffer()
+        data = [rand(UInt8, 16) for _ in 1:6]
+        samples = rand(Float32, 10, 2)
+        # write some chunks before and after the data chunk
+        WAVSink(io) do sink
+            writemeta(sink, b"BEFR", data[1])
+            writemeta(sink, b"BEFR", data[2])
+            writemeta(sink, b"BOTH", data[3])
+            write(sink, samples)
+            writemeta(sink, b"AFTR", data[4])
+            writemeta(sink, b"BOTH", data[5])
+            writemeta(sink, b"AFTR", data[6])
+        end
+        seek(io, 0)
+        WAVSource(io) do src
+            @test read(src) == samples
+            @test metadata(src, b"BEFR") == data[1]
+            @test metadata(src, b"BEFR", 1) == data[1]
+            @test metadata(src, b"BEFR", 2) == data[2]
+            @test metadata(src, b"BOTH") == data[3]
+            @test metadata(src, b"AFTR") == data[4]
+            @test metadata(src, b"BOTH", 2) == data[5]
+            @test metadata(src, b"AFTR", 2) == data[6]
+        end
+    end
 end
 # These float array comparison functions are from dists.jl
 # function absdiff(current::AbstractArray{T}, target::AbstractArray{T}) where T <: Real

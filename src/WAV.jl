@@ -2,7 +2,7 @@
 Base.__precompile__(true)
 module WAV
 export WAVSink, WAVSource
-export WAVFormatExtension, WAVFormat
+export writemeta
 export WAVE_FORMAT_PCM, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_ALAW, WAVE_FORMAT_MULAW
 
 using FileIO

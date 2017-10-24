@@ -165,7 +165,7 @@ function writemeta(sink::WAVSink, key::ChunkKey, chunkdata::Vector{UInt8})
     if sink.writingdata
         # we're in the middle of the sample data, so defer this metadata
         # to the end
-        push!(sink, (key, chunkdata))
+        push!(sink.pending_metadata, (key, chunkdata))
     else
         sink.rifflen += writechunk(sink.io, key, chunkdata)
     end

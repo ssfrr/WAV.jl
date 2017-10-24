@@ -1,6 +1,7 @@
 decodemulaw(encoded) = reinterpret(Fixed{Int16, 15}, mudecode_table[encoded+1])
 decodealaw(encoded) = reinterpret(Fixed{Int16, 15}, adecode_table[encoded+1])
 
+encodemulaw(sample::Fixed{Int16, 15}) = encodemulaw(reinterpret(sample))
 function encodemulaw(sample)
     cBias = 0x84
     cClip = 32635
@@ -18,6 +19,7 @@ function encodemulaw(sample)
     UInt8((~ (sampleSign | (sampleExponent << 4) | mantissa)) & 0xff)
 end
 
+encodealaw(sample::Fixed{Int16, 15}) = encodealaw(reinterpret(sample))
 function encodealaw(sample)
     cBias = 0x84
     cClip = 32635
