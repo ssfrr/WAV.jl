@@ -1,3 +1,43 @@
+@testset "Writing WAV Files" begin
+    @testset "Default WAVSink Properties" begin
+        io = IOBuffer()
+        WAVSink(io) do sink
+            @test eltype(sink) == Float32
+            @test nchannels(sink) == 2
+            @test samplerate(sink) == 48000
+        end
+    end
+
+    @testset "Lossless Round-Trip" begin
+        freqs = [480, 960]
+        sig = sin.(2pi*freqs' .* (0:99)/48000) * 0.3
+        for T in [
+                Float64,
+                Float32,
+                Fixed{Int64, 63},
+                Fixed{Int32, 31},
+                Fixed{Int32, 23},
+                Fixed{Int32, 19},
+                Fixed{Int16, 15},
+                Fixed{Int8, 7},
+                Fixed{Int8, 5},
+                ]
+            @testset "$T" begin
+                testdata = map(T, sig)
+                io = IOBuffer()
+                WAVSink(io, eltype=T) do sink
+                    write(sink, testdata)
+                    @test eltype(sink) == T
+                end
+                seek(io, 0)
+                WAVSource(io) do src
+                    @test eltype(src) == T
+                    @test read(src) == testdata
+                end
+            end
+        end
+    end
+end
 # These float array comparison functions are from dists.jl
 # function absdiff(current::AbstractArray{T}, target::AbstractArray{T}) where T <: Real
 #     @assert all(size(current) == size(target))

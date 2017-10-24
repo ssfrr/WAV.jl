@@ -10,7 +10,7 @@ available until the whole file is read.
 mutable struct WAVSource{IO, T} <: SampleSource
     io::IO
     format::WAVFormat
-    opt::Dict{String, Vector{Vector{UInt8}}}
+    opt::Dict{ChunkKey, Vector{Vector{UInt8}}}
     file_bytesleft::Int
     data_bytesleft::Int
 end
@@ -31,6 +31,7 @@ end
 SampledSignals.nchannels(src::WAVSource) = Int(src.format.nchannels)
 SampledSignals.samplerate(src::WAVSource) = float(src.format.sample_rate)
 Base.eltype(::WAVSource{IO, T}) where {IO, T} = T
+Base.close(src::WAVSource) = nothing
 
 SampledSignals.metadata(src::WAVSource, key) = src.opt[key][1]
 SampledSignals.metadata(src::WAVSource, key, ::Colon) = src.opt[key]
@@ -234,7 +235,7 @@ along the way. This function expects the stream to be right after the end
 of a previous chunk, i.e. the next think in the stream is a chunk header.
 """
 function find_format(io, bytesleft)
-    opt = Dict{String, Vector{Vector{UInt8}}}()
+    opt = Dict{ChunkKey, Vector{Vector{UInt8}}}()
     while isnull(bytesleft) || bytesleft > SUBCHUNK_HEADER_SIZE
         (subchunk_id,
          subchunk_size,

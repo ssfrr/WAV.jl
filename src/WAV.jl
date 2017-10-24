@@ -24,4 +24,16 @@ include("fileio.jl")
 include("wavsource.jl")
 include("wavsink.jl")
 
+# implement do syntax to close stream automatically
+for StrType in [:WAVSource, :WAVSink]
+    @eval function $StrType(fn::Function, io::IO; kwargs...)
+        stream = $StrType(io; kwargs...)
+        try
+            fn(stream)
+        finally
+            close(stream)
+        end
+    end
+end
+
 end # module

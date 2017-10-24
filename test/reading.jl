@@ -97,15 +97,15 @@
             src = WAVSource(io)
             # read from it to make sure we've parsed all the chunks
             read(src)
-            @test typeof(metadata(src, :LIST)) == Vector{UInt8}
+            @test typeof(metadata(src, b"LIST")) == Vector{UInt8}
 
             # by default we get the first one if there are duplicates
-            @test typeof(metadata(src, :DISP)) == Vector{UInt8}
+            @test typeof(metadata(src, b"DISP")) == Vector{UInt8}
             # we can get a list of them by indexing with `:`
-            @test length(metadata(src, :DISP, :)) == 2
+            @test length(metadata(src, b"DISP", :)) == 2
             # we can access elements of the list by giving an index
-            @test typeof(metadata(src, :DISP, 1)) == Vector{UInt8}
-            @test typeof(metadata(src, :DISP, 2)) == Vector{UInt8}
+            @test typeof(metadata(src, b"DISP", 1)) == Vector{UInt8}
+            @test typeof(metadata(src, b"DISP", 2)) == Vector{UInt8}
         end
     end
 end

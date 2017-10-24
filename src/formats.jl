@@ -45,7 +45,7 @@ function WAVFormat(eltype, nchannels, samplerate, compression)
         else
             WAVFormatExtension()
         end
-    
+
     WAVFormat(fmtcode, nchannels, samplerate, bps, blockalign,
               containerbytes*8, ext)
 end
@@ -70,13 +70,11 @@ function needs_extensible(eltype, nchannels)
     # criteria from http://www-mmsp.ece.mcgill.ca/Documents/AudioFormats/WAVE/WAVE.html
     if nchannels > 2
         true
-    end
-    # if pcm data is > 16bit or doesn't fit evenly into its container size
-    if eltype <: Fixed && (validbits(eltype) > 16 || validbits(eltype) % 8 != 0)
+    elseif eltype <: Fixed && (validbits(eltype) > 16 || validbits(eltype) % 8 != 0)
         true
+    else
+        false
     end
-
-    false
 end
 
 """

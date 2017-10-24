@@ -96,7 +96,7 @@ function WAVSink(io::T; eltype=nothing,
     rifflen = 4 # needs to include the initial "WAVE" block
     fmt = WAVFormat(eltype, nchannels, samplerate, compression)
     rifflen += write_format(io, fmt)
-    
+
     if fmt != WAVE_FORMAT_PCM
         # non-PCM files require a FACT chunk
         write(io, b"fact")
@@ -237,17 +237,17 @@ function encode_buffer(dest, src::Array{Fixed{Int16, 15}, N},
     rawidx = 1
     if isformat(format, WAVE_FORMAT_PCM)
         # OK, just a normal 16-bit PCM
-        for frame in (1:framecount) + frameoffset, ch in 1:size(dest, 2)
+        for frame in (1:framecount) + frameoffset, ch in 1:size(src, 2)
             encodewavbytes(src[frame, ch], dest, rawidx, 2)
             rawidx += 2
         end
     elseif isformat(format, WAVE_FORMAT_MULAW)
-        for frame in (1:framecount) + frameoffset, ch in 1:size(dest, 2)
+        for frame in (1:framecount) + frameoffset, ch in 1:size(src, 2)
             dest[rawidx] = encodemulaw(src[frame, ch])
             rawidx += 1
         end
     elseif isformat(format, WAVE_FORMAT_ALAW)
-        for frame in (1:framecount) + frameoffset, ch in 1:size(dest, 2)
+        for frame in (1:framecount) + frameoffset, ch in 1:size(src, 2)
             dest[rawidx] = encodealaw(src[frame, ch])
             rawidx += 1
         end
@@ -317,179 +317,113 @@ for (inttype, fromtype) in [
     end
 end
 
-function(value::Fixed{T, f}, rawdata, rawidx, nbytes) where {T, f}
-    encodewavbytes(reinterpret(T, value), rawdata, rawidx, nbytes)
+function encodewavbytes(value::Fixed{T, f}, rawdata, rawidx, nbytes) where {T, f}
+    intval = reinterpret(T, value)
+    # fixed-point values should be left-justified within the byte
+    shift = 8nbytes - (f+1)
+    encodewavbytes(intval << shift, rawdata, rawidx, nbytes)
 end
 
-
-
-
-
-write_standard_header(io, databytes) = write_header(io, UInt32(databytes + 36))
-write_extended_header(io, databytes) = write_header(io, UInt32(databytes + 60))
-
-function ieee_float_container_type(nbits)
-    if nbits == 32
-        return Float32
-    elseif nbits == 64
-        return Float64
-    end
-
-    error("$nbits bits is not supported for WAVE_FORMAT_IEEE_FLOAT.")
+# 8-bit(and less) PCM is treated as unsigned 0x00 - 0xff, so we offset it so to
+# users it looks like a normal 8-bit fixed-point value
+function encodewavbytes(value::Fixed{Int8, f}, rawdata, rawidx, nbytes) where {f}
+    @assert nbytes == 1
+    intval = reinterpret(UInt8, reinterpret(Int8, value))
+    # fixed-point values should be left-justified within the byte
+    shift = 8 - (f+1)
+    rawdata[rawidx] = intval << shift + 0x80
 end
 
-function write_pcm_samples(io::IO, fmt::WAVFormat, samples::AbstractArray{<:Integer})
-    nbits = validbits(fmt)
-    # number of bytes per sample
-    nbytes = ceil(Integer, nbits / 8)
-    for i = 1:size(samples, 1)
-        for j = 1:size(samples, 2)
-            my_sample = samples[i, j]
-            # shift my_sample into the N most significant bits
-            my_sample <<= nbytes * 8 - nbits
-            for k = 1:nbytes
-                write_le(io, convert(UInt8, my_sample & 0xff))
-                my_sample = my_sample >> 8
-            end
-        end
-    end
-end
-
-function write_pcm_samples(io::IO, fmt::WAVFormat, samples::AbstractArray{T}) where T <: AbstractFloat
-    nbits = validbits(fmt)
-    # Scale the floating point values to the PCM range
-    if nbits > 8
-        # two's complement
-        samples = convert(Array{pcm_container_type(nbits)}, round.(samples * (2.0^(nbits - 1) - 1)))
-    else
-        # offset binary
-        samples = convert(Array{UInt8}, round.((samples .+ 1.0) / 2.0 * (2.0^nbits - 1)))
-    end
-    return write_pcm_samples(io, fmt, samples)
-end
-
-function write_ieee_float_samples(io::IO, samples)
-    # Interleave the channel samples before writing to the stream.
-    for i = 1:size(samples, 1) # for each sample
-        for j = 1:size(samples, 2) # for each channel
-            write_le(io, samples[i, j])
-        end
-    end
-end
-
-# take the loop variable type out of the loop
-function write_ieee_float_samples(io::IO, fmt::WAVFormat, samples)
-    floatType = ieee_float_container_type(validbits(fmt))
-    write_ieee_float_samples(io, convert(Array{floatType}, samples))
-end
-
-function write_data(io::IO, fmt::WAVFormat, samples::AbstractArray)
-    if isformat(fmt, WAVE_FORMAT_PCM)
-        return write_pcm_samples(io, fmt, samples)
-    elseif isformat(fmt, WAVE_FORMAT_IEEE_FLOAT)
-        return write_ieee_float_samples(io, fmt, samples)
-    elseif isformat(fmt, WAVE_FORMAT_MULAW)
-        return write_companded_samples(io, samples, compress_sample_mulaw)
-    elseif isformat(fmt, WAVE_FORMAT_ALAW)
-        return write_companded_samples(io, samples, compress_sample_alaw)
-    else
-        error("$(fmt.compression_code) is an unsupported compression code.")
-    end
-end
-
-make_range(subrange) = subrange
-make_range(subrange::Number) = 1:convert(Int, subrange)
-
-function wavread(filename::AbstractString; subrange=Void, format="double")
-    open(filename, "r") do io
-        wavread(io, subrange=subrange, format=format)
-    end
-end
-
-get_default_compression(::AbstractArray{T}) where T <: Integer = WAVE_FORMAT_PCM
-get_default_compression(::AbstractArray{T}) where T<:AbstractFloat = WAVE_FORMAT_IEEE_FLOAT
-get_default_pcm_precision(::AbstractArray{UInt8}) = 8
-get_default_pcm_precision(::AbstractArray{Int16}) = 16
-get_default_pcm_precision(::Any) = 24
-
-function get_default_precision(samples, compression)
-    if compression == WAVE_FORMAT_ALAW || compression == WAVE_FORMAT_MULAW
-        return 8
-    elseif compression == WAVE_FORMAT_IEEE_FLOAT
-        return 32
-    end
-    get_default_pcm_precision(samples)
-end
-
-function wavwrite(samples::AbstractArray, io::IO; Fs=8000, nbits=0, compression=0,
-                  chunks::Dict{Symbol, Array{UInt8,1}}=Dict{Symbol, Array{UInt8,1}}())
-    if compression == 0
-        compression = get_default_compression(samples)
-    elseif compression == WAVE_FORMAT_ALAW || compression == WAVE_FORMAT_MULAW
-        nbits = 8
-    end
-    if nbits == 0
-        nbits = get_default_precision(samples, compression)
-    end
-    compression_code = compression
-    nchannels = size(samples, 2)
-    sample_rate = Fs
-    my_nbits = ceil(Integer, nbits / 8) * 8
-    block_align = my_nbits / 8 * nchannels
-    bps = sample_rate * block_align
-    data_length::UInt32 = size(samples, 1) * block_align
-    ext = WAVFormatExtension()
-
-    if nchannels > 2 || my_nbits > 16 || my_nbits != nbits
-        compression_code = WAVE_FORMAT_EXTENSIBLE
-        valid_bits_per_sample = nbits
-        channel_mask = 0
-        sub_format = Array{UInt8, 1}(0)
-        if compression == WAVE_FORMAT_PCM
-            sub_format = KSDATAFORMAT_SUBTYPE_PCM
-        elseif compression == WAVE_FORMAT_IEEE_FLOAT
-            sub_format = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-        elseif compression == WAVE_FORMAT_ALAW
-            sub_format = KSDATAFORMAT_SUBTYPE_ALAW
-        elseif compression == WAVE_FORMAT_MULAW
-            sub_format = KSDATAFORMAT_SUBTYPE_MULAW
-        else
-            error("Unsupported extension sub format: $compression")
-        end
-        ext = WAVFormatExtension(valid_bits_per_sample, channel_mask, sub_format)
-        write_extended_header(io, data_length)
-    else
-        write_standard_header(io, data_length)
-    end
-    fmt = WAVFormat(compression_code,
-                    nchannels,
-                    sample_rate,
-                    bps,
-                    block_align,
-                    my_nbits,
-                    ext)
-    write_format(io, fmt)
-
-    for eachchunk in chunks
-        write(io, eachchunk[1])
-        write_le(io, UInt32(length(eachchunk[2])))
-        for eachbyte in eachchunk[2]
-            write(io, eachbyte)
-        end
-    end
-
-    # write the data subchunk header
-    write(io, b"data")
-    write_le(io, data_length) # UInt32
-    write_data(io, fmt, samples)
-end
-
-function wavwrite(samples::AbstractArray, filename::AbstractString; Fs=8000, nbits=0, compression=0,
-                  chunks::Dict{Symbol, Array{UInt8,1}}=Dict{Symbol, Array{UInt8,1}}())
-    open(filename, "w") do io
-        wavwrite(samples, io, Fs=Fs, nbits=nbits, compression=compression, chunks=chunks)
-    end
-end
+# function wavread(filename::AbstractString; subrange=Void, format="double")
+#     open(filename, "r") do io
+#         wavread(io, subrange=subrange, format=format)
+#     end
+# end
+#
+# get_default_compression(::AbstractArray{T}) where T <: Integer = WAVE_FORMAT_PCM
+# get_default_compression(::AbstractArray{T}) where T<:AbstractFloat = WAVE_FORMAT_IEEE_FLOAT
+# get_default_pcm_precision(::AbstractArray{UInt8}) = 8
+# get_default_pcm_precision(::AbstractArray{Int16}) = 16
+# get_default_pcm_precision(::Any) = 24
+#
+# function get_default_precision(samples, compression)
+#     if compression == WAVE_FORMAT_ALAW || compression == WAVE_FORMAT_MULAW
+#         return 8
+#     elseif compression == WAVE_FORMAT_IEEE_FLOAT
+#         return 32
+#     end
+#     get_default_pcm_precision(samples)
+# end
+#
+# function wavwrite(samples::AbstractArray, io::IO; Fs=8000, nbits=0, compression=0,
+#                   chunks::Dict{Symbol, Array{UInt8,1}}=Dict{Symbol, Array{UInt8,1}}())
+#     if compression == 0
+#         compression = get_default_compression(samples)
+#     elseif compression == WAVE_FORMAT_ALAW || compression == WAVE_FORMAT_MULAW
+#         nbits = 8
+#     end
+#     if nbits == 0
+#         nbits = get_default_precision(samples, compression)
+#     end
+#     compression_code = compression
+#     nchannels = size(samples, 2)
+#     sample_rate = Fs
+#     my_nbits = ceil(Integer, nbits / 8) * 8
+#     block_align = my_nbits / 8 * nchannels
+#     bps = sample_rate * block_align
+#     data_length::UInt32 = size(samples, 1) * block_align
+#     ext = WAVFormatExtension()
+#
+#     if nchannels > 2 || my_nbits > 16 || my_nbits != nbits
+#         compression_code = WAVE_FORMAT_EXTENSIBLE
+#         valid_bits_per_sample = nbits
+#         channel_mask = 0
+#         sub_format = Array{UInt8, 1}(0)
+#         if compression == WAVE_FORMAT_PCM
+#             sub_format = KSDATAFORMAT_SUBTYPE_PCM
+#         elseif compression == WAVE_FORMAT_IEEE_FLOAT
+#             sub_format = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+#         elseif compression == WAVE_FORMAT_ALAW
+#             sub_format = KSDATAFORMAT_SUBTYPE_ALAW
+#         elseif compression == WAVE_FORMAT_MULAW
+#             sub_format = KSDATAFORMAT_SUBTYPE_MULAW
+#         else
+#             error("Unsupported extension sub format: $compression")
+#         end
+#         ext = WAVFormatExtension(valid_bits_per_sample, channel_mask, sub_format)
+#         write_extended_header(io, data_length)
+#     else
+#         write_standard_header(io, data_length)
+#     end
+#     fmt = WAVFormat(compression_code,
+#                     nchannels,
+#                     sample_rate,
+#                     bps,
+#                     block_align,
+#                     my_nbits,
+#                     ext)
+#     write_format(io, fmt)
+#
+#     for eachchunk in chunks
+#         write(io, eachchunk[1])
+#         write_le(io, UInt32(length(eachchunk[2])))
+#         for eachbyte in eachchunk[2]
+#             write(io, eachbyte)
+#         end
+#     end
+#
+#     # write the data subchunk header
+#     write(io, b"data")
+#     write_le(io, data_length) # UInt32
+#     write_data(io, fmt, samples)
+# end
+#
+# function wavwrite(samples::AbstractArray, filename::AbstractString; Fs=8000, nbits=0, compression=0,
+#                   chunks::Dict{Symbol, Array{UInt8,1}}=Dict{Symbol, Array{UInt8,1}}())
+#     open(filename, "w") do io
+#         wavwrite(samples, io, Fs=Fs, nbits=nbits, compression=compression, chunks=chunks)
+#     end
+# end
 
 # function wavappend(samples::AbstractArray, io::IO)
 #     seekstart(io)
