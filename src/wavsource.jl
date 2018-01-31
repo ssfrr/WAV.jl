@@ -38,9 +38,9 @@ SampledSignals.metadata(src::WAVSource, key, ::Colon) = src.opt[key]
 SampledSignals.metadata(src::WAVSource, key, idx) = src.opt[key][idx]
 
 # These are the MATLAB compatible signatures
-wavread(filename::AbstractString, fmt::AbstractString) = wavread(filename, format=fmt)
-wavread(filename::AbstractString, n) = wavread(filename, subrange=n)
-wavread(filename::AbstractString, n, fmt) = wavread(filename, subrange=n, format=fmt)
+# wavread(filename::AbstractString, fmt::AbstractString) = wavread(filename, format=fmt)
+# wavread(filename::AbstractString, n) = wavread(filename, subrange=n)
+# wavread(filename::AbstractString, n, fmt) = wavread(filename, subrange=n, format=fmt)
 
 # implement SampledSignals's read method to plug into the stream conversion
 # infrastructure
